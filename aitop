@@ -1,0 +1,1502 @@
+#!/usr/bin/env python3
+"""Read Claude/Codex local status without starting or resuming sessions."""
+import argparse
+from contextlib import closing
+from datetime import datetime
+import functools
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import unicodedata
+
+__version__ = '0.1.0'
+TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
+READ_CAP = 1024 * 1024
+# The live view reads everything every second, and most transcripts stop changing
+# once their session or agent ends. Parsed reads are kept here and reused while the
+# file stays the same. collect() drops what a pass did not use, so files that are
+# gone do not pile up.
+CACHE, USED = {}, set()
+
+
+def object_json(value):
+    try:
+        data = json.loads(value)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def read_object(path):
+    try:
+        return object_json(path.read_text())
+    except OSError:
+        return {}
+
+
+def records(path, tail=False):
+    """Bound transcript reads; tolerate partial final writes and large lines.
+
+    A read is reused while the file keeps its inode, size and modification time.
+    Transcripts are only appended to, so the head of one that already held
+    READ_CAP bytes is reused as it grows. A file within READ_CAP has one read for
+    both ends. Callers must not change the returned list.
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return []
+    tail = tail and info.st_size > READ_CAP
+    key, stamp = ('records', str(path), tail), (info.st_ino, info.st_size, info.st_mtime_ns)
+    USED.add(key)
+    hit = CACHE.get(key)
+    if hit and (hit[0] == stamp or (not tail and hit[0][0] == info.st_ino
+                                    and hit[0][1] >= READ_CAP and info.st_size >= READ_CAP)):
+        return hit[1]
+    try:
+        with path.open('rb') as stream:
+            size = stream.seek(0, 2)
+            offset = max(0, size - READ_CAP) if tail else 0
+            stream.seek(offset)
+            if offset:
+                stream.readline(READ_CAP)
+            data = stream.read(READ_CAP)
+    except OSError:
+        return []
+    rows = parse(data)
+    CACHE[key] = (stamp, rows)
+    return rows
+
+
+def parse(data):
+    # The last record may be incomplete; JSON parsing handles it.
+    return [row for line in data.splitlines() if (row := object_json(line))]
+
+
+def timestamp(value):
+    try:
+        if isinstance(value, (float, int)):
+            return value / 1000 if value > 10**11 else value
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return 0
+
+
+def agent_activity(last):
+    """What a Claude agent is on: its latest tool call, in the words it gave."""
+    for record in reversed(last):
+        content = record.get('message', {}).get('content') if record.get('type') == 'assistant' else None
+        for part in reversed(content if isinstance(content, list) else []):
+            if isinstance(part, dict) and part.get('type') == 'tool_use':
+                given = part.get('input') if isinstance(part.get('input'), dict) else {}
+                if given.get('description'):
+                    return given['description']
+                target = given.get('file_path') or given.get('url') or given.get('query') or ''
+                name = part.get('name', '')
+                return f"{name} {Path(target).name if given.get('file_path') else target}".strip()
+    return ''
+
+
+def mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def recent_state(updated, now, running=False):
+    if now - updated >= 240:
+        return 'unknown'
+    return 'in-progress' if running else 'recent-output'
+
+
+def row(ai, kind, identifier, cwd, updated, state, title='', **detail):
+    return dict(ai=ai, kind=kind, id=identifier, cwd=str(cwd), updated=updated,
+                state=state, title=title, **detail)
+
+
+# Claude writes each background shell command's output to
+# /tmp/claude-<uid>/<encoded project>/<session>/tasks/<id>.output and ends the
+# file with "[exited with code N]" or "[killed]". While the command runs, its
+# processes hold the file open as stdout, which is the live check.
+TASK_ROOT = Path('/tmp') / f'claude-{os.getuid()}'
+TASK_END = re.compile(rb'\[(?:exited with code (-?\d+)|(killed))\]\s*$')
+# "Command running in background with ID: x", or "... moved to the background
+# (ID: x)" when a foreground command hits its timeout.
+TASK_ID = re.compile(r'background (?:with |\()ID: (\w+)')
+# A task reports its ID when it starts, or at the timeout (10 minutes at most).
+LOOKUP_SPAN = 660
+# A command reports progress as "[n/m]" at the start of a line or "n%" at its end.
+# Only those two spots count, so track numbers ("2/10") or dates in output are not read.
+TASK_PROGRESS = re.compile(rb'^\s*\[(\d+)/(\d+)\]|(\d{1,3}(?:\.\d+)?)%\s*$')
+PROGRESS_SPAN = 4096
+
+
+def task_end(path):
+    """Return the exit code, 'killed', or None while no end marker is written."""
+    try:
+        with path.open('rb') as stream:
+            stream.seek(max(0, stream.seek(0, 2) - 256))
+            match = TASK_END.search(stream.read())
+    except OSError:
+        return None
+    if not match:
+        return None
+    return 'killed' if match.group(2) else int(match.group(1))
+
+
+def task_progress(path):
+    """Return (percent, label) from the last progress mark near the end of the output, or None."""
+    try:
+        with path.open('rb') as stream:
+            offset = max(0, stream.seek(0, 2) - PROGRESS_SPAN)
+            stream.seek(offset)
+            data = stream.read()
+    except OSError:
+        return None
+    # Progress bars redraw with carriage returns, so each redraw is a line of its own.
+    lines = re.split(rb'[\r\n]+', data)
+    if offset:
+        lines = lines[1:]  # the read may start mid-line
+    for line in reversed(lines):
+        match = TASK_PROGRESS.search(line)
+        if not match:
+            continue
+        if match.group(1):
+            done, total = int(match.group(1)), int(match.group(2))
+            if 0 < total and done <= total:
+                return done * 100 / total, f'{done}/{total}'
+        elif float(match.group(3)) <= 100:
+            return float(match.group(3)), match.group(3).decode() + '%'
+    return None
+
+
+# Colour and cursor sequences a command prints, so they never reach the screen.
+ANSI = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]')
+
+
+def task_last_line(path):
+    """Return the last non-empty line a command printed, without escape sequences, or None."""
+    try:
+        with path.open('rb') as stream:
+            offset = max(0, stream.seek(0, 2) - PROGRESS_SPAN)
+            stream.seek(offset)
+            data = stream.read()
+    except OSError:
+        return None
+    lines = re.split(rb'[\r\n]+', ANSI.sub(b'', data))
+    if offset:
+        lines = lines[1:]  # the read may start mid-line
+    for line in reversed(lines):
+        text = clean(line.decode('utf-8', 'replace'), 300)
+        if text and not TASK_END.search(line):
+            return text
+    return None
+
+
+def held_open(paths):
+    """Return paths held open for writing, or None when inspection fails."""
+    if not paths:
+        return set()
+    # -w: a slow network mount (SMB, NFS) makes lsof warn "can't stat()" on
+    # stderr even when the files asked about are local. That warning is not a
+    # failure to inspect these paths, so it must not turn every task unknown.
+    try:
+        probe = subprocess.run(['lsof', '-w', '-Ffan', '--', *map(str, paths)],
+                               capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # A warning continues on indented lines ("Output information may be incomplete.").
+    errors = [line for line in probe.stderr.splitlines()
+              if line.strip() and not line.startswith(('lsof: WARNING:', ' ', '\t'))]
+    if probe.returncode not in (0, 1) or errors:
+        return None
+    writable, result = False, set()
+    for line in probe.stdout.splitlines():
+        if line.startswith(('p', 'f')):
+            writable = False
+        elif line.startswith('a'):
+            writable = line[1:] in ('w', 'u')
+        elif line.startswith('n') and writable:
+            result.add(line[1:])
+    return result
+
+
+def task_details(transcript):
+    """Map background task IDs to their public command descriptions and start times.
+
+    Also return the earliest time the read covers, 0 for the whole file, or None
+    when the transcript cannot be read, and the shell calls still waiting for a
+    result, oldest first.
+    """
+    try:
+        size = transcript.stat().st_size
+    except OSError:
+        return {}, None, []
+    titles, pending = {}, []
+    tail = records(transcript, tail=True)
+    scan_tasks(tail, titles, pending)
+    stamps = [s for s in (timestamp(r.get('timestamp')) for r in tail) if s]
+    return titles, 0 if size <= READ_CAP else min(stamps, default=None), pending
+
+
+def scan_tasks(rows, titles, pending=None):
+    started = {}
+    for record in rows:
+        result = record.get('toolUseResult')
+        # Only the conversation itself: an api-request-blob record repeats the
+        # calls after their results, which would read as calls still running.
+        kind = record.get('type')
+        content = record.get('message', {}).get('content')
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            given = block.get('input')
+            given = given if isinstance(given, dict) else {}
+            # Not only run_in_background: a foreground command can be sent to the background later.
+            if kind == 'assistant' and block.get('type') == 'tool_use' and block.get('name') == 'Bash':
+                started[block.get('id')] = dict(title=given.get('description') or '(no description)',
+                                                command=given.get('command'),
+                                                started=timestamp(record.get('timestamp')))
+            elif kind == 'user' and block.get('type') == 'tool_result' and block.get('tool_use_id') in started:
+                detail = started.pop(block['tool_use_id'])
+                # Newer versions keep the ID in a field. Command output can quote the
+                # message text, so read the text only when the field record is absent.
+                if isinstance(result, dict):
+                    task, timeout = result.get('backgroundTaskId'), bool(result.get('timedOutAfterMs'))
+                else:
+                    found = TASK_ID.search(json.dumps(block.get('content'), ensure_ascii=False))
+                    task, timeout = found and found.group(1), bool(found) and '(' in found.group(0)
+                if task:
+                    titles.setdefault(task, dict(detail, timeout=True) if timeout else detail)
+    if pending is not None:
+        pending.extend(started.values())
+
+
+def first_stamp(stream, offset):
+    """Timestamp of the first whole record after offset, or None past the end."""
+    stream.seek(offset)
+    if offset:
+        stream.readline()
+    while line := stream.readline():
+        if stamp := timestamp(object_json(line).get('timestamp')):
+            return stamp
+    return None
+
+
+def stamp_offset(stream, size, when):
+    """Offset at most READ_CAP before the first record at or after `when`."""
+    low, high = 0, size
+    while high - low > READ_CAP:
+        middle = (low + high) // 2
+        stamp = first_stamp(stream, middle)
+        if stamp is None or stamp >= when:
+            high = middle
+        else:
+            low = middle
+    return low
+
+
+def older_tasks(transcript, births):
+    """Find tasks the tail read missed by reading only around when each output file was made.
+
+    Transcripts only grow, so a bisect on record timestamps finds that spot
+    without reading the whole file. Those spots lie before the tail read and no
+    longer change, so the answer is kept while the same tasks are asked about.
+    """
+    key = ('older', str(transcript), frozenset(births.items()))
+    USED.add(key)
+    if key in CACHE:
+        return CACHE[key]
+    titles, spans = {}, []
+    try:
+        with transcript.open('rb') as stream:
+            size = stream.seek(0, 2)
+            for born in births.values():
+                start = stamp_offset(stream, size, born - LOOKUP_SPAN)
+                end = stamp_offset(stream, size, born + LOOKUP_SPAN) + READ_CAP
+                spans.append([start, min(size, end, start + 8 * READ_CAP)])
+            merged = []
+            for span in sorted(spans):
+                if merged and span[0] <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], span[1])
+                else:
+                    merged.append(span)
+            for start, end in merged:
+                stream.seek(start)
+                if start:
+                    stream.readline()
+                scan_tasks(parse(stream.read(max(0, end - stream.tell()))), titles)
+    except OSError:
+        return {}
+    CACHE[key] = {task: value for task, value in titles.items() if task in births}
+    return CACHE[key]
+
+
+def birthtime(path):
+    try:
+        return getattr(path.stat(), 'st_birthtime', None)
+    except OSError:
+        return None
+
+
+def task_rows(project, now, session='*'):
+    """Rows for background commands started from one transcript project directory."""
+    # A subagent's output file is a symlink to its transcript; the agent rows cover it.
+    ends = {path: task_end(path)
+            for path in sorted((TASK_ROOT / project.name).glob(session + '/tasks/*.output'))
+            if not path.is_symlink()}
+    held = held_open([path.resolve() for path, end in ends.items() if end is None])
+    titles, result = {}, []
+    for path, end in ends.items():
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        owner = path.parents[1].name
+        if owner not in titles:
+            transcript = project / (owner + '.jsonl')
+            found, since, pending = titles[owner] = task_details(transcript)
+            # Without a birth time (Linux) there is no spot to look, so those keep no title.
+            births = {other.stem: born for other in ends
+                      if other.parents[1].name == owner and other.stem not in found
+                      and (born := birthtime(other)) and since and born < since}
+            if births:
+                found.update(older_tasks(transcript, births))
+        found, since, pending = titles[owner]
+        born = getattr(info, 'st_birthtime', None)
+        live = end is None and held is not None and str(path.resolve()) in held
+        detail, mode = found.get(path.stem), 'bg'
+        if detail is None and live and pending:
+            # A foreground command holds its output file only while it runs, and its
+            # call has no result yet. Calls run in order, so the oldest one is running.
+            detail, mode = pending.pop(0), 'fg'
+        elif detail is None:
+            mode = None
+            # Claude gives every shell command an output file while it runs. One the
+            # covered transcript never reported as a background task is a foreground command.
+            if since is not None and (since == 0 or (born and born >= since)):
+                continue
+        if end is None:
+            # No marker and no open handle: the command died with its session.
+            state = 'unknown' if held is None else 'running' if live else 'stopped'
+        else:
+            state = 'stopped' if end == 'killed' else 'finished' if end == 0 else 'failed'
+        detail = detail or {}
+        born = detail.get('started') or born
+        title = detail.get('title') or '(no description)'
+        uptime = max(0, int(now - born)) if born and state == 'running' else None
+        percent, label = task_progress(path) or (None, None)
+        # Time left at the rate so far; a stopped task keeps its last mark without one.
+        left = (uptime * (100 - percent) / percent
+                if uptime and percent and percent < 100 else None)
+        result.append(row('claude', 'task', path.stem, project.name, info.st_mtime, state,
+                          title + (' (timeout)' if detail.get('timeout') else ''),
+                          parent=owner, mode=mode, uptime=uptime, command=detail.get('command'),
+                          progress=percent, progress_label=label, left=left,
+                          last_line=task_last_line(path),
+                          exit_code=end if isinstance(end, int) else None,
+                          evidence='output end marker + lsof writable handle'))
+    return result
+
+
+class ClaudeReader:
+    def __init__(self, root):
+        self.root = root / 'projects'
+
+    def read(self, project, all_projects, now):
+        roots = sorted(self.root.glob('*')) if all_projects else []
+        if not all_projects:
+            for parent in (project, *project.parents):
+                candidate = self.root / re.sub(r'[^a-zA-Z0-9-]', '-', str(parent))
+                if candidate.is_dir():
+                    roots = [candidate]
+                    break
+        result = []
+        for root in roots:
+            for path in root.glob('*.jsonl'):
+                session = self.session(path, root.name, now)
+                if session:
+                    result.append(session)
+            for path in root.glob('*/subagents/agent-*.jsonl'):
+                result.append(self.agent(path, root.name, now, path.parents[1].name))
+            for directory in root.glob('*/subagents/workflows/wf_*'):
+                if not directory.is_dir():
+                    continue
+                agents = [self.agent(p, root.name, now, directory.name)
+                          for p in directory.glob('agent-*.jsonl')]
+                journal = directory / 'journal.jsonl'
+                updated = max([mtime(journal), mtime(directory), *[a['updated'] for a in agents]])
+                scripts = sorted((directory.parents[2] / 'workflows/scripts').glob('*-' + directory.name + '.js'))
+                title = scripts[0].name[:-(len(directory.name) + 4)] if scripts else directory.name
+                result.append(row('claude', 'workflow', directory.name, root.name, updated,
+                                  recent_state(updated, now), title,
+                                  parent=directory.parents[2].name, agents=agents,
+                                  evidence='transcript activity; workflow completion unknown'))
+            result.extend(task_rows(root, now))
+        return result
+
+    def session(self, path, cwd, now):
+        first, last = records(path), records(path, tail=True)
+        messages = [r for r in last if r.get('type') in ('user', 'assistant')
+                    and not r.get('isSidechain') and not r.get('isMeta')]
+        if not messages:
+            return None
+        latest = messages[-1]
+        updated = timestamp(latest.get('timestamp')) or mtime(path)
+        state = recent_state(updated, now)
+        if latest.get('type') == 'assistant' and latest.get('message', {}).get('stop_reason') == 'end_turn':
+            state = 'turn-complete'
+        # Claude Code records an API failure as a synthetic assistant message; the turn is
+        # over until someone resumes the session, so it should not stay unknown forever.
+        elif latest.get('isApiErrorMessage'):
+            state = 'failed'
+        title = next((r.get('customTitle') or r.get('aiTitle') for r in reversed(last)
+                      if r.get('customTitle') or r.get('aiTitle')), '')
+        title = title or next((r.get('slug') for r in reversed(messages) if r.get('slug')), '')
+        cwd = latest.get('cwd') or next((r.get('cwd') for r in first if r.get('cwd')), cwd)
+        return row('claude', 'session', path.stem, cwd, updated, state,
+                   title or '(untitled)', evidence='local transcript; no live process probe')
+
+    def agent(self, path, cwd, now, parent):
+        meta = read_object(path.with_suffix('.meta.json'))
+        first, last = records(path), records(path, tail=True)
+        updated = mtime(path)
+        state = recent_state(updated, now)
+        assistant = [r.get('message', {}) for r in last if r.get('type') == 'assistant']
+        # Hook attachments can trail the final turn, so judge by the last message.
+        turns = [r for r in last if r.get('type') in ('user', 'assistant')]
+        final = turns[-1] if turns else {}
+        # This is a completed assistant turn, not proof the whole agent succeeded.
+        if final.get('type') == 'assistant' and final.get('message', {}).get('stop_reason') == 'end_turn':
+            state = 'turn-complete'
+        # Newer agents end by handing their result back through a tool call.
+        if meta.get('finished') or (final.get('type') == 'user' and final.get('toolEndsTurn')):
+            state = 'finished'
+        if meta.get('stoppedByUser'):
+            state = 'stopped'
+        prompt = ''
+        for item in first:
+            if item.get('type') == 'user':
+                content = item.get('message', {}).get('content', '')
+                if isinstance(content, str):
+                    prompt = content
+                elif isinstance(content, list):
+                    prompt = ' '.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
+                break
+        ended = state in TERMINAL_STATES
+        started = next((t for t in (timestamp(r.get('timestamp')) for r in first) if t), None)
+        return row('claude', 'agent', path.stem.removeprefix('agent-'), cwd, updated, state,
+                   meta.get('description') or meta.get('agentType') or '(no description)',
+                   parent=parent, model=assistant[-1].get('model', '') if assistant else '',
+                   task=prompt, evidence='local transcript + metadata',
+                   uptime=None if started is None else max(0, int((updated if ended else now) - started)),
+                   last_line='' if ended else agent_activity(last))
+
+
+def connect_readonly(path):
+    connection = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)
+    connection.row_factory = sqlite3.Row
+    connection.execute('PRAGMA query_only=ON')
+    return connection
+
+
+# The live view splits the same stored commands every second; keep the answers.
+@functools.lru_cache(maxsize=4096)
+def command_program(command):
+    """Show only a program name, never its arguments or environment values."""
+    if not isinstance(command, str) or not command:
+        return '(shell command)'
+    try:
+        words = shlex.split(command)
+        if len(words) >= 3 and Path(words[0]).name in ('sh', 'bash', 'zsh') and 'c' in words[1]:
+            words = shlex.split(words[2])
+        name = Path(words[0]).name if words else ''
+        return name if re.fullmatch(r'[A-Za-z][A-Za-z0-9_.+-]{0,39}', name) else '(shell command)'
+    except (ValueError, TypeError):
+        return '(shell command)'
+
+
+@functools.lru_cache(maxsize=4096)
+def command_body(command, quoted=True):
+    """The script a shell wrapper runs, for the details pane only; titles stay program names.
+
+    Stored Codex commands are shell-quoted. ps joins argv with spaces and prints
+    control characters as octal escapes, so its text is split, never re-parsed.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return None
+    if not quoted:
+        command = re.sub(r'\\([0-3][0-7]{2})', lambda m: chr(int(m.group(1), 8))
+                         if int(m.group(1), 8) < 32 else m.group(0), command)
+    try:
+        words = shlex.split(command) if quoted else command.split(None, 2)
+    except ValueError:
+        return command
+    if (len(words) >= 3 and Path(words[0]).name in ('sh', 'bash', 'zsh')
+            and words[1].startswith('-') and 'c' in words[1]):
+        return words[2]
+    return command
+
+
+def codex_arguments(processes, environment, timeout):
+    """Map PID to its argv text, without environment values; empty when ps cannot say."""
+    if not processes or timeout <= 0:
+        return {}
+    try:
+        probe = subprocess.run(['ps', '-ww', '-p', ','.join(map(str, processes)),
+                                '-o', 'pid=,lstart=,command='], capture_output=True,
+                               text=True, timeout=timeout, env=environment)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    result = {}
+    for line in probe.stdout.splitlines():
+        fields = line.split(None, 6)
+        if len(fields) != 7:
+            continue
+        try:
+            pid = int(fields[0])
+            started = datetime.strptime(' '.join(fields[1:6]), '%a %b %d %H:%M:%S %Y').timestamp()
+        except ValueError:
+            continue
+        if processes.get(pid) == started:
+            result[pid] = fields[6]
+    return result
+
+
+def codex_processes(thread_ids):
+    """Inspect live command roots; logical Codex process IDs are not OS PIDs.
+
+    Codex spawns command roots as children and passes CODEX_THREAD_ID. MCP and
+    code-mode helpers do not qualify. Read the environment only in memory;
+    return program names and the matching thread ID, plus argv without
+    environment values for the details pane.
+    """
+    if not thread_ids:
+        return []
+    environment = dict(os.environ, LC_ALL='C')
+    deadline = time.monotonic() + 3
+    try:
+        listing = subprocess.run(['ps', '-ww', '-axo', 'pid=,ppid=,lstart=,comm='],
+                                 capture_output=True, text=True, timeout=3,
+                                 env=environment, check=True)
+        processes = {}
+        for line in listing.stdout.splitlines():
+            fields = line.split(None, 7)
+            if len(fields) != 8:
+                continue
+            pid, parent = int(fields[0]), int(fields[1])
+            started = datetime.strptime(' '.join(fields[2:7]), '%a %b %d %H:%M:%S %Y').timestamp()
+            processes[pid] = dict(pid=pid, parent=parent, started=started, program=fields[7])
+        backends = {pid for pid, p in processes.items() if Path(p['program']).name == 'codex'}
+        ancestors, current = set(), os.getpid()
+        while current in processes and current not in ancestors:
+            ancestors.add(current)
+            current = processes[current]['parent']
+        candidates = {pid: p for pid, p in processes.items()
+                      if p['parent'] in backends and pid not in ancestors
+                      and Path(p['program']).name != 'codex-code-mode-host'}
+        if not candidates:
+            return []
+        result = []
+        # Bound argv size when a host has many sessions. A process can exit
+        # between the two ps calls; return code 1 with no stderr is normal.
+        ids = list(candidates)
+        for offset in range(0, len(ids), 100):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            probe = subprocess.run(['ps', 'eww', '-p', ','.join(map(str, ids[offset:offset+100])),
+                                    '-o', 'pid=,lstart=,command='], capture_output=True,
+                                   text=True, timeout=remaining, env=environment)
+            if probe.returncode not in (0, 1) or probe.stderr:
+                return None
+            for line in probe.stdout.splitlines():
+                fields = line.split(None, 6)
+                if len(fields) != 7:
+                    continue
+                pid = int(fields[0])
+                process = candidates.get(pid)
+                started = datetime.strptime(' '.join(fields[1:6]), '%a %b %d %H:%M:%S %Y').timestamp()
+                if not process or process['started'] != started:
+                    continue  # PID reuse between probes.
+                owners = re.findall(r'(?:^|\s)CODEX_THREAD_ID=([0-9A-Za-z-]+)(?=\s|$)', fields[6])
+                if owners and owners[-1] in thread_ids:
+                    result.append(dict(thread_id=owners[-1], os_pid=pid, started=started,
+                                       title=command_program(shlex.quote(process['program']))))
+        # A second read without the environment, so the details pane gets argv alone.
+        argv = codex_arguments({p['os_pid']: p['started'] for p in result},
+                               environment, deadline - time.monotonic())
+        for p in result:
+            p['command'] = command_body(argv.get(p['os_pid']), quoted=False)
+        return result
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def codex_waiting_since(rollout):
+    """When the thread's oldest tool call still waiting for output was made.
+
+    0 when nothing is waiting, None when the rollout cannot be read. Codex code
+    mode hands back "Script running with cell ID N" once a script outlasts its
+    yield time, so a command still running after its call has output carries on
+    in the background, and one under an unanswered call is being waited on.
+    """
+    if not rollout:
+        return None
+    path = Path(rollout)
+    if not path.is_file():
+        return None
+    calls, answered = {}, set()
+    for record in records(path, tail=True):
+        payload = record.get('payload')
+        kind = payload.get('type') if isinstance(payload, dict) else None
+        if kind in ('function_call', 'custom_tool_call'):
+            calls[payload.get('call_id')] = timestamp(record.get('timestamp'))
+        elif kind in ('function_call_output', 'custom_tool_call_output'):
+            answered.add(payload.get('call_id'))
+    return min((t for c, t in calls.items() if c not in answered and t), default=0)
+
+
+def codex_mode(started, waiting):
+    if waiting is None:
+        return None
+    # ps reports start times in whole seconds.
+    return 'fg' if waiting and started >= int(waiting) - 1 else 'bg'
+
+
+class CodexReader:
+    def __init__(self, root):
+        self.root = root
+        self.warnings = []
+
+    def database(self):
+        """The on-disk schema is versioned; fall back to rollouts if unavailable."""
+        paths = sorted(self.root.glob('state_*.sqlite'),
+                       key=lambda p: int(p.stem.split('_')[-1]) if p.stem.split('_')[-1].isdigit() else -1,
+                       reverse=True)
+        if not paths:
+            return None
+        try:
+            with closing(connect_readonly(paths[0])) as db:
+                threads = [dict(r) for r in db.execute('SELECT * FROM threads')]
+                columns = {r[1] for r in db.execute('PRAGMA table_info(threads)')}
+                if not {'id', 'cwd', 'rollout_path'}.issubset(columns):
+                    raise ValueError('unsupported threads schema')
+                try:
+                    parents = {r['child_thread_id']: r['parent_thread_id']
+                               for r in db.execute('SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges')}
+                except sqlite3.Error:
+                    parents = {}
+            for thread in threads:
+                thread['parent'] = parents.get(thread['id'], '')
+            return threads
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            self.warnings.append(f'Codex database unavailable; reading rollouts ({exc})')
+            return None
+
+    def history(self):
+        path = self.root / 'thread_history_1.sqlite'
+        if not path.is_file():
+            return {}
+        try:
+            with closing(connect_readonly(path)) as db:
+                return {r['thread_id']: dict(r) for r in db.execute('''
+                    SELECT t.thread_id,t.status,t.started_at,t.completed_at
+                    FROM thread_turns t WHERE t.rollout_ordinal = (
+                      SELECT MAX(n.rollout_ordinal) FROM thread_turns n WHERE n.thread_id=t.thread_id)
+                ''')}
+        except (sqlite3.Error, OSError) as exc:
+            self.warnings.append(f'Codex turn history unavailable; reading rollouts ({exc})')
+            return {}
+
+    def command_history(self, threads):
+        """Read command metadata only; output and reasoning are not selected."""
+        path = self.root / 'thread_history_1.sqlite'
+        if not path.is_file() or not threads:
+            return []
+        try:
+            with closing(connect_readonly(path)) as db:
+                columns = {r[1] for r in db.execute('PRAGMA table_info(thread_items)')}
+                started = 'started_at_ms' if 'started_at_ms' in columns else 'NULL'
+                completed = 'completed_at_ms' if 'completed_at_ms' in columns else 'NULL'
+                result = []
+                for thread in threads:
+                    result.extend(dict(r, thread_id=thread['id']) for r in db.execute(f'''
+                        SELECT item_id,{started} AS started_ms,{completed} AS completed_ms,
+                          json_extract(item_json,'$.processId') AS process_id,
+                          json_extract(item_json,'$.status') AS status,
+                          json_extract(item_json,'$.command') AS command,
+                          json_extract(item_json,'$.exitCode') AS exit_code
+                        FROM thread_items WHERE thread_id=? AND item_type='commandExecution'
+                        ORDER BY rollout_ordinal DESC LIMIT 200
+                    ''', (thread['id'],)))
+                return result
+        except (sqlite3.Error, OSError):
+            self.warnings.append('Codex command history unavailable; exit codes cannot be read.')
+            return []
+
+    def tasks(self, threads, now, include_ended=False):
+        owners = {t['id']: t for t in threads}
+        live = codex_processes(set(owners))
+        if live is None:
+            self.warnings.append('Codex live command inspection unavailable; running tasks cannot be confirmed.')
+        waiting = {}
+        for p in live or []:
+            if p['thread_id'] not in waiting:
+                waiting[p['thread_id']] = codex_waiting_since(owners[p['thread_id']].get('rollout_path'))
+        result = [row('codex', 'task', 'pid-' + str(p['os_pid']), owners[p['thread_id']]['cwd'],
+                      now, 'running', p['title'], parent=p['thread_id'], os_pid=p['os_pid'],
+                      mode=codex_mode(p['started'], waiting[p['thread_id']]),
+                      command=p.get('command'),
+                      process_id=None, uptime=max(0, int(now-p['started'])), exit_code=None,
+                      evidence='live Codex child process + CODEX_THREAD_ID') for p in live or []]
+        if include_ended or live is None:
+            for command in self.command_history(threads):
+                code, status = command['exit_code'], command['status']
+                code = code if isinstance(code, int) and not isinstance(code, bool) else None
+                state = ('finished' if code == 0 else 'failed') if code is not None else {
+                    'declined': 'stopped', 'interrupted': 'stopped', 'completed': 'finished',
+                    'failed': 'failed'}.get(status, 'unknown')
+                if not include_ended and state in TERMINAL_STATES:
+                    continue
+                updated = timestamp(command['completed_ms'] or command['started_ms'])
+                result.append(row('codex', 'task', command['item_id'],
+                                  owners[command['thread_id']]['cwd'], updated, state,
+                                  command_program(command['command']), parent=command['thread_id'],
+                                  command=command_body(command['command']), os_pid=None, process_id=command['process_id'], uptime=None,
+                                  exit_code=code, evidence='stored commandExecution metadata; latest 200 commands per thread'))
+        return result
+
+    def read(self, project, all_projects, now, include_ended=False):
+        threads = self.database()
+        if threads is None:
+            threads = []
+            for path in self.root.glob('sessions/*/*/*/rollout-*.jsonl'):
+                meta = next((r.get('payload', {}) for r in records(path) if r.get('type') == 'session_meta'), {})
+                if meta.get('id') and meta.get('cwd'):
+                    threads.append({**meta, 'rollout_path': str(path)})
+        # Review machinery is not a user-created session or delegated agent.
+        threads = [t for t in threads if t.get('thread_source') != 'guardian_review'
+                   and 'guardian' not in str(t.get('source', ''))]
+        if not all_projects:
+            nearest = next((str(p) for p in (project, *project.parents)
+                            if any(t.get('cwd') == str(p) for t in threads)), None)
+            threads = [t for t in threads if t.get('cwd') == nearest]
+        history = self.history()
+        result = []
+        for thread in threads:
+            path = Path(thread['rollout_path'])
+            last = records(path, tail=True)
+            updated = max(timestamp(thread.get('updated_at_ms') or thread.get('updated_at')), mtime(path))
+            turn = history.get(thread['id'], {})
+            status = turn.get('status', '')
+            status_at = timestamp(turn.get('completed_at') or turn.get('started_at'))
+            model = thread.get('model') or ''
+            for item in last:
+                payload = item.get('payload', {})
+                if not isinstance(payload, dict):
+                    continue
+                if item.get('type') == 'turn_context':
+                    model = payload.get('model', model)
+                if item.get('type') != 'event_msg':
+                    continue
+                event = {'task_started': 'inProgress', 'task_complete': 'completed',
+                         'turn_aborted': 'interrupted'}.get(payload.get('type'))
+                event_at = timestamp(item.get('timestamp'))
+                if event and event_at >= status_at:
+                    status, status_at = event, event_at
+            updated = max(updated, status_at)
+            state = {'completed': 'turn-complete', 'interrupted': 'stopped', 'failed': 'failed'}.get(status)
+            if not state:
+                state = recent_state(updated, now, running=status == 'inProgress')
+            source = object_json(thread.get('source')) if isinstance(thread.get('source'), str) else thread.get('source', {})
+            source = source if isinstance(source, dict) else {}
+            subagent = source.get('subagent', {})
+            spawn = subagent.get('thread_spawn', {}) if isinstance(subagent, dict) else {}
+            parent = thread.get('parent') or (spawn.get('parent_thread_id', '') if isinstance(spawn, dict) else '')
+            kind = 'agent' if parent or subagent else 'session'
+            result.append(row('codex', kind, thread['id'], thread['cwd'], updated, state,
+                              thread.get('name') or thread.get('title') or thread.get('agent_nickname') or '(untitled)',
+                              parent=parent, model=model, task=thread.get('first_user_message', ''),
+                              archived=bool(thread.get('archived')), evidence='stored turn state; no live process probe'))
+        result.extend(self.tasks(threads, now, include_ended))
+        return result
+
+
+def clean(value, limit=100):
+    # Log text must not issue terminal escape sequences.
+    return ' '.join(''.join(c for c in str(value) if c.isprintable() or c.isspace()).split())[:limit]
+
+
+# Record kinds aitop reads from Claude and Codex itself. Everything else comes
+# from aibus and takes its source as the kind.
+CORE_KINDS = ('session', 'workflow', 'agent', 'task')
+# aibus judges liveness. Its 'stopped' means the process went away without
+# reporting an end, which needs attention, so it shows as 'gone' instead of
+# joining the ended states that are hidden by default.
+BUS_STATES = {'stopped': 'gone'}
+BUS_ENDED = ('finished', 'failed')
+
+
+# aibus accepts the same names, so anything else did not come from it.
+BUS_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+
+
+def number(value):
+    """A finite JSON number, or None. Booleans and integers too big for a float are not numbers here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def bus_text(item, key, limit):
+    value = item.get(key)
+    return clean(value, limit) if isinstance(value, str) else ''
+
+
+def aibus_rows(now):
+    """Rows for what other tools report on aibus (https://github.com/dor1a/aibus).
+
+    MCP servers, verifiers and scheduled checks each write an entry there, and
+    `aibus ls --json` lists them with their judged status. Without aibus on
+    PATH there is nothing to show and no warning.
+    """
+    exe = shutil.which('aibus')
+    if not exe:
+        return [], []
+    try:
+        listing = subprocess.run([exe, 'ls', '--json', '--reader', 'aitop'], capture_output=True, text=True,
+                                 timeout=3, check=True)
+        data = json.loads(listing.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return [], ['aibus unavailable: aibus ls failed, timed out or printed something else.']
+    items = data.get('items') if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return [], ['aibus printed an unexpected format.']
+    rows = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source, ident = item.get('source'), item.get('id')
+        if not (isinstance(source, str) and BUS_NAME.fullmatch(source)
+                and isinstance(ident, str) and BUS_NAME.fullmatch(ident)):
+            continue
+        # A source named like a core kind keeps its own group. aibus names have
+        # no ':', so the prefixed kind cannot meet a real source.
+        kind = f'aibus:{source}' if source in CORE_KINDS + ('bg-task',) else source
+        status = bus_text(item, 'status', 20) or bus_text(item, 'state', 20) or 'unknown'
+        status = BUS_STATES.get(status, status)
+        started, updated = number(item.get('started')), number(item.get('updated'))
+        updated = now if updated is None else updated
+        pid = number(item.get('pid'))
+        # A pid aibus did not judge gone is a live process.
+        uptime = (max(0, int(now - started)) if started is not None and status not in BUS_ENDED + ('gone',)
+                  and (pid or status == 'running') else None)
+        exit_code = number(item.get('exit_code'))
+        links = item.get('links') if isinstance(item.get('links'), dict) else {}
+        last_line = bus_text(item, 'now', 300)
+        # The AI column says where the row came from; the reported AI stays for
+        # the details pane and for the AI filter.
+        r = row('aibus', kind, ident, '', updated, status,
+                bus_text(item, 'title', 300) or ident, source=source, bus_ai=bus_text(item, 'ai', 20),
+                last_line=last_line, exit_code=exit_code if isinstance(exit_code, int) else None,
+                uptime=uptime, quiet=not last_line, host=bus_text(item, 'host', 80),
+                links=' '.join(f'{clean(k, 40)} {clean(v, 200)}' for k, v in links.items()),
+                evidence='aibus entry; status judged by aibus ls')
+        progress = item.get('progress')
+        if isinstance(progress, list) and len(progress) == 2:
+            done, total = (number(n) if isinstance(n, int) else None for n in progress)
+            if done is not None and total and 0 <= done <= total:
+                r['progress'] = 100 * done / total
+                r['progress_label'] = f'{done}/{total}'
+        rows.append(r)
+    listed = data.get('warnings')
+    warnings = [f'aibus: {clean(w, 200)}' for w in (listed if isinstance(listed, list) else [])[:3]
+                if isinstance(w, str)]
+    return rows, warnings
+
+
+def duration(seconds):
+    if seconds is None:
+        return '-'
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f'{days}d{hours:02}h'
+    if hours:
+        return f'{hours}h{minutes:02}m'
+    if minutes:
+        return f'{minutes}m{seconds:02}s'
+    return f'{seconds}s'
+
+
+def progress(r):
+    return '-' if r.get('progress') is None else f"{int(r['progress'])}%"
+
+
+def render(rows, verbose, show_all, now):
+    kind_order = {'session': 0, 'workflow': 1, 'agent': 2, 'task': 3, 'mcp': 4}
+    shown = sorted((r for r in rows if show_all or
+                    (not r.get('archived') and r['state'] not in TERMINAL_STATES)),
+                   key=lambda r: (kind_order.get(r['kind'], 5), r['ai'],
+                                  0 if r.get('quiet') else -r['updated'],
+                                  r['title'], r['id']))
+    print(f"=== {time.strftime('%H:%M:%S')} | {len(shown)} shown | {len(rows)-len(shown)} hidden (-l) ===")
+    print()
+    if shown:
+        print(f"{'AI':6} {'KIND':8} {'ID':12} {'STATE':14} {'LAST':7} {'UPTIME':8} {'PROGRESS':8} {'LEFT':7}  NAME / TITLE")
+    if not shown:
+        print('No ongoing or uncertain records in this scope. Use -l for history or --all-projects for all projects.')
+    for r in shown:
+        age = None if r.get('quiet') else max(0, int(now-r['updated']))
+        exit_code = r.get('exit_code')
+        state = r['state'] + (f'({exit_code})' if exit_code is not None else '')
+        kind = f"{r['mode']}-task" if r.get('mode') else r['kind']
+        print(f"{r['ai']:6} {kind:8} {clean(r['id'], 12):12} {state:14} {duration(age):7} {duration(r.get('uptime')):8} {progress(r):8} {duration(r.get('left')):7}  {clean(r['title'], 65)}")
+        if verbose:
+            print(f"  id={clean(r['id'])} parent={clean(r.get('parent') or '-')} model={clean(r.get('model') or '-')}")
+            if r.get('progress_label'):
+                print(f"  progress={r['progress_label']}")
+            if r['ai'] == 'codex' and r['kind'] == 'task':
+                print(f"  os_pid={r.get('os_pid') or '-'} codex_process_id={clean(r.get('process_id') or '-')}")
+            print(f"  project={clean(r['cwd'], 200)} | {r['evidence']}")
+            if r.get('task'):
+                print('  ' + clean(r['task'], 160))
+
+
+def collect(ai, project, all_projects, include_ended, bus, kind=None):
+    """Read every source once and return (now, rows, warnings)."""
+    now, rows, warnings = time.time(), [], []
+    USED.clear()
+    if ai in ('claude', 'both'):
+        rows.extend(ClaudeReader(Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home()/'.claude')))).read(project, all_projects, now))
+    if ai in ('codex', 'both'):
+        reader = CodexReader(Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))))
+        rows.extend(reader.read(project, all_projects, now, include_ended))
+        warnings.extend(reader.warnings)
+    # Workflow children are regular rows, so the same state/kind filters
+    # apply to them even when verbose output is disabled.
+    rows = [item for parent in rows for item in [parent, *parent.get('agents', [])]]
+    if bus:
+        reported, bus_warnings = aibus_rows(now)
+        rows.extend(r for r in reported if ai in ('both', r['bus_ai']))
+        warnings.extend(bus_warnings)
+    if kind:
+        rows = [r for r in rows if has_kind(r, kind)]
+    for key in CACHE.keys() - USED:
+        del CACHE[key]
+    return now, rows, warnings
+
+
+# Live view. Drawing is kept apart from curses so tests can read the lines.
+# MCP servers stay up all session, so they sit on top and new work appears under them.
+TUI_GROUPS = [('mcp', 'MCP'), ('task', 'Tasks'), ('bg-task', 'Background Tasks'), ('session', 'Sessions'),
+              ('workflow', 'Workflows'), ('agent', 'Agents')]
+
+
+def tui_group(r):
+    """The live view's group key: shell commands split by whether they run in the background."""
+    return 'bg-task' if r['kind'] == 'task' and r.get('mode') == 'bg' else r['kind']
+
+
+def has_kind(r, kind):
+    """--kind matches the record kind, the live view's group, or the aibus source name."""
+    return kind in (r['kind'], tui_group(r), r.get('source'))
+
+
+def tui_groups(rows):
+    """TUI_GROUPS plus one group per other aibus source, after the background tasks."""
+    names = {tui_group(r): r.get('source') or tui_group(r) for r in rows}
+    extra = sorted(set(names) - set(dict(TUI_GROUPS)), key=lambda kind: (names[kind], kind))
+    groups = []
+    for kind, label in TUI_GROUPS:
+        groups.append((kind, label))
+        if kind == 'bg-task':
+            groups += [(kind, names[kind]) for kind in extra]
+    return groups
+TUI_ICONS = {'running': ('●', 'ok'), 'in-progress': ('◐', 'ok'), 'recent-output': ('○', 'info'),
+             'unknown': ('?', 'warn'), 'turn-complete': ('✓', 'dim'), 'finished': ('✓', 'dim'),
+             'stopped': ('■', 'dim'), 'failed': ('✗', 'bad'),
+             # States that aibus entries add.
+             'ok': ('●', 'ok'), 'warn': ('!', 'warn'), 'late': ('?', 'warn'), 'gone': ('✗', 'bad')}
+TUI_AI = ['both', 'claude', 'codex']
+# The theme's own grey (ANSI bright black). A fixed neutral grey such as 238 looked
+# gold next to a blue-black background like Tokyo Night's.
+SELECTED_BG = 8
+
+
+def cell_width(text):
+    """Terminal columns for text; East Asian wide characters take two."""
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WF' else 1
+               for c in text)
+
+
+def fit(text, width, align='<'):
+    """Cut text to width columns, ending in an ellipsis, and pad it to exactly that width."""
+    if width <= 0:
+        return ''
+    if cell_width(text) > width:
+        out, used = '', 0
+        for c in text:
+            if used + cell_width(c) > width - 1:
+                break
+            out, used = out + c, used + cell_width(c)
+        text = out + '…'
+    pad = ' ' * (width - cell_width(text))
+    return pad + text if align == '>' else text + pad
+
+
+def tui_key(r):
+    return r['ai'], r['kind'], r['id']
+
+
+def tui_visible(rows, view, show_all=None):
+    """Rows the live view shows, in display order: grouped by kind, newest first."""
+    show_all = view['show_all'] if show_all is None else show_all
+    query = view['query'].lower()
+    keep = [r for r in rows
+            if (show_all or (not r.get('archived') and r['state'] not in TERMINAL_STATES))
+            and view['ai'] in ('both', r['ai'], r.get('bus_ai'))
+            and (not view['kind'] or has_kind(r, view['kind']))
+            and (not query or query in f"{r['title']} {r['id']}".lower())]
+    order = {kind: i for i, (kind, _) in enumerate(tui_groups(keep))}
+    return sorted(keep, key=lambda r: (order.get(tui_group(r), len(order)), r['ai'],
+                                       0 if r.get('quiet') else -r['updated'], r['title'], r['id']))
+
+
+def tui_columns(width, both, has_left=False):
+    """(name, label, width, align) for each column; NOW and the title split what is left."""
+    head = [('state', 'STATE', 14, '<')]
+    # LEFT needs a progress mark, so it only takes room while some command reports one.
+    tail = ([('left', 'LEFT', 9, '<')] if has_left else []) + [('uptime', 'UPTIME', 9, '<'),
+                                                             ('idle', 'LAST', 10, '<')]
+    if both:
+        tail.append(('ai', 'AI', 6, '<'))
+    used = 4 + sum(w + 2 for _, _, w, _ in head + tail) + 2  # two spaces after every column, NOW too
+    now = max(0, (width - used) // 2)
+    return head + [('now', 'NOW', now, '<')] + tail + [('title', 'NAME / TITLE', max(0, width - used - now), '<')]
+
+
+def tui_cells(r, now):
+    code = r.get('exit_code')
+    age = None if r.get('quiet') else max(0, int(now - r['updated']))
+    return {
+        'state': r['state'] + (f'({code})' if code is not None else ''),
+        'now': clean(r.get('last_line') or '', 300),
+        'left': duration(r['left']) if r.get('left') is not None else '',
+        'uptime': duration(r['uptime']) if r.get('uptime') is not None else '',
+        'idle': '' if age is None else 'now' if age < 2 else f'{duration(age)} ago',
+        'ai': r['ai'],
+        'title': clean(r['title'], 300),
+    }
+
+
+def tui_row(r, now, cols, selected):
+    icon, style = TUI_ICONS.get(r['state'], ('·', 'dim'))
+    cells = tui_cells(r, now)
+    segments = [('▶ ' if selected else '  ', ''), (icon + ' ', style)]
+    for name, _, width, align in cols:
+        text = fit(cells[name], width, align)
+        segments.append((text, style if name == 'state' else 'meta' if name in ('ai', 'left', 'uptime', 'idle') else ''))
+        segments.append(('  ', ''))
+    return segments[:-1]
+
+
+def tui_detail(r, width):
+    """Short fields packed on shared lines, long ones on their own."""
+    kind = f"{r['mode']}-task" if r.get('mode') else r['kind']
+    short = [('id', r['id']), ('kind', kind), ('ai', r.get('bus_ai') or r['ai']), ('parent', r.get('parent')),
+             ('model', r.get('model')), ('progress', r.get('progress_label')),
+             ('os pid', r.get('os_pid')), ('codex process', r.get('process_id')), ('host', r.get('host'))]
+    long = [('project', r['cwd']), ('evidence', r.get('evidence')), ('task', r.get('task')),
+            ('links', r.get('links'))]
+    lines, line = [], ''
+    for name, value in short:
+        if value in (None, ''):
+            continue
+        part = f'{name} {clean(value, 80)}'
+        if line and cell_width(line) + 3 + cell_width(part) > width - 2:
+            lines.append(line)
+            line = ''
+        line = f'{line}   {part}' if line else part
+    if line:
+        lines.append(line)
+    lines += [f'{name} {clean(value, 300)}' for name, value in long if value not in (None, '')]
+    if r.get('command'):
+        lines += tui_command(r['command'], width)
+    if r.get('last_line') not in (None, ''):
+        lines.append(f"output {clean(r['last_line'], 300)}")
+    return [[(' ' + fit(text, width - 1), '')] for text in lines]
+
+
+COMMAND_LINES = 5
+
+
+def tui_command(command, width):
+    """A command wrapped to the pane, at most COMMAND_LINES screen lines, labelled on the first."""
+    label = 'command '
+    room = max(10, width - 1 - cell_width(label))
+    pieces = []
+    for line in str(command).expandtabs(4).splitlines() or ['']:
+        # Printable characters only, so a command cannot send terminal escapes.
+        line = ''.join(c for c in line if c.isprintable()).rstrip()
+        while True:
+            cut = used = 0
+            for c in line:
+                if used + cell_width(c) > room:
+                    break
+                used += cell_width(c)
+                cut += 1
+            pieces.append(line[:cut])
+            line = line[cut:]
+            if not line:
+                break
+    if len(pieces) > COMMAND_LINES:
+        more = len(pieces) - COMMAND_LINES + 1
+        pieces = pieces[:COMMAND_LINES - 1] + [f'(+{more} more lines)']
+    return [label + pieces[0]] + [' ' * cell_width(label) + piece for piece in pieces[1:]]
+
+
+def tui_screen(rows, warnings, now, view, width, height):
+    """Lines for one frame: (segments, highlighted, row key or None), segments as (text, style).
+
+    The row key lets a mouse click find the row drawn on that line.
+    """
+    shown = tui_visible(rows, view)
+    keys = [tui_key(r) for r in shown]
+    if view['selected'] not in keys:
+        view['selected'] = keys[0] if keys else None
+    both = view['ai'] == 'both' and len({r['ai'] for r in shown}) > 1
+    cols = tui_columns(width, both, any(r.get('left') is not None for r in shown))
+    scope = {'both': 'claude+codex', 'claude': 'claude', 'codex': 'codex'}[view['ai']]
+    flags = ([scope, 'all projects'] + (['showing hidden'] if view['show_all'] else [])
+             + ([f"kind {view['kind']}"] if view['kind'] else [])
+             + ([f"search '{clean(view['query'], 30)}'"] if view['query'] else []))
+    right = '   '.join(flags + [time.strftime('%H:%M:%S', time.localtime(now))]) + ' '
+    top = [([(fit(' aitop', width - cell_width(right)) + right, 'title')], False, None)]
+    # Every column is left aligned, and STATE starts over the state icon.
+    header = '  ' + '  '.join(fit(label, w + 2 if name == 'state' else w, align)
+                              for name, label, w, align in cols)
+    top.append(([(fit(header, width), 'head')], False, None))
+
+    body, mark = [], None
+    groups = tui_groups(shown)
+    for kind, label in groups + [(None, 'Other')]:
+        group = [r for r in shown if (tui_group(r) == kind if kind else tui_group(r) not in dict(groups))]
+        if not group:
+            continue
+        # Groups fed by aibus say so once in their title rather than on every row.
+        body.append(([(fit(f' {label}', width), 'group')], False, None))
+        for r in group:
+            lit = tui_key(r) == view['selected']
+            mark = len(body) if lit else mark
+            body.append((tui_row(r, now, cols, lit), lit, tui_key(r)))
+    if not body:
+        body.append(([(fit('  Nothing to show. Press l to include hidden records.', width), 'meta')], False, None))
+
+    bottom = []
+    if view['detail'] and view['selected'] in keys:
+        rule = '─ Details '
+        bottom.append(([(rule + '─' * max(0, width - cell_width(rule)), 'dim')], False, None))
+        bottom += [(line, False, None) for line in tui_detail(shown[keys.index(view['selected'])], width)]
+    for warning in warnings[:2]:
+        bottom.append(([(fit(' ! ' + clean(warning, 300), width), 'warn')], False, None))
+    hidden = len(tui_visible(rows, view, show_all=True)) - len(shown)
+    count = f'{len(shown)} shown' + (f', {hidden} hidden ' if hidden else ' ')
+    if view['typing'] is not None:
+        hint = f' /{view["typing"]}▏  Enter apply  Esc cancel'
+    else:
+        hint = (' ↑↓ move  ⏎ details  l hidden  a AI  / search  '
+                + ('Esc clear search  ' if view['query'] else '') + 'q quit')
+    bottom.append(([(fit(hint, width - cell_width(count)) + count, 'bar')], False, None))
+    # On a short screen the details and warnings give way from the bottom; the key bar and one row stay.
+    while len(bottom) > 1 and len(top) + 1 + len(bottom) > height:
+        bottom.pop(-2)
+
+    room = max(1, height - len(top) - len(bottom))
+    if mark is not None:
+        if mark < view['offset']:
+            view['offset'] = max(0, mark - 1)  # keep the group label above the first row
+        elif mark >= view['offset'] + room:
+            view['offset'] = mark - room + 1
+    view['offset'] = max(0, min(view['offset'], len(body) - room))
+    shown_body = body[view['offset']:view['offset'] + room]
+    # Blank lines push details, warnings and the key bar to the bottom of the screen.
+    gap = [([(' ' * width, '')], False, None)] * (room - len(shown_body))
+    # The fixed columns alone are wider than a narrow pane, so every line is cut to the width.
+    return [(clip(segments, width), lit, key) for segments, lit, key in top + shown_body + gap + bottom]
+
+
+def clip(segments, width):
+    """Cut a line's (text, style) segments to at most width screen cells."""
+    cut, room = [], width
+    for text, style in segments:
+        if cell_width(text) > room:
+            kept = used = 0
+            for c in text:
+                if used + cell_width(c) > room:
+                    break
+                used += cell_width(c)
+                kept += 1
+            # The line ends here, even when a wide character leaves one cell free.
+            cut.append((text[:kept], style))
+            break
+        cut.append((text, style))
+        room -= cell_width(text)
+    return cut
+
+
+def tui_handle(view, key, rows):
+    """Apply one key and return 'quit' to leave.
+
+    A key is a character, 'up', 'down', 'enter', 'esc', 'backspace', or a mouse
+    event: ('click', row key) or ('double', row key), with None off the rows.
+    """
+    if isinstance(key, tuple):
+        event, target = key
+        if target is not None and view['typing'] is None:
+            # ncurses may send a click before a double click or only the double
+            # click; selecting on both and toggling on the double gives one result.
+            view['selected'] = target
+            if event == 'double':
+                view['detail'] = not view['detail']
+        return None
+    if view['typing'] is not None:
+        if key == 'enter':
+            view['query'], view['typing'] = view['typing'], None
+        elif key == 'esc':
+            view['typing'] = None
+        elif key == 'backspace':
+            view['typing'] = view['typing'][:-1]
+        elif len(key) == 1 and key.isprintable():
+            view['typing'] += key
+        return None
+    if key in ('q', 'Q'):
+        return 'quit'
+    if key in ('up', 'k', 'down', 'j'):
+        keys = [tui_key(r) for r in tui_visible(rows, view)]
+        if keys:
+            i = keys.index(view['selected']) if view['selected'] in keys else 0
+            view['selected'] = keys[max(0, min(len(keys) - 1, i + (-1 if key in ('up', 'k') else 1)))]
+    elif key == 'enter':
+        view['detail'] = not view['detail']
+    elif key == 'l':
+        view['show_all'] = not view['show_all']
+    elif key == 'a':
+        view['ai'] = TUI_AI[(TUI_AI.index(view['ai']) + 1) % len(TUI_AI)]
+    elif key == '/':
+        view['typing'] = view['query']
+    elif key == 'esc':
+        view['query'] = ''
+    return None
+
+
+def run_tui(view, project):
+    import curses
+    import locale
+    import threading
+
+    locale.setlocale(locale.LC_ALL, '')
+    os.environ.setdefault('ESCDELAY', '25')
+    latest = {'data': (time.time(), [], []), 'error': None}
+    stop = threading.Event()
+
+    def reader():
+        # Reading takes a fraction of a second, so it runs beside the keys.
+        while not stop.is_set():
+            try:
+                latest['data'], latest['error'] = collect('both', project, True, True, True), None
+            except Exception as error:  # keep the view up and say why it is stale
+                latest['error'] = f'read failed: {type(error).__name__}: {error}'
+            stop.wait(1)
+
+    names = {'\n': 'enter', '\r': 'enter', '\x1b': 'esc', '\x7f': 'backspace', '\b': 'backspace'}
+
+    def loop(screen):
+        curses.curs_set(0)
+        styles = {'title': curses.A_REVERSE | curses.A_BOLD, 'bar': curses.A_REVERSE,
+                  'group': curses.A_BOLD, 'dim': curses.A_NORMAL, 'head': curses.A_BOLD,
+                  'meta': curses.A_NORMAL}
+        selected = curses.A_REVERSE
+        lit_styles = {}
+        if curses.has_colors():
+            curses.use_default_colors()
+            colors = {'ok': curses.COLOR_GREEN, 'bad': curses.COLOR_RED, 'warn': curses.COLOR_YELLOW,
+                      'info': curses.COLOR_CYAN}
+            for i, (name, color) in enumerate(colors.items(), 1):
+                curses.init_pair(i, color, -1)
+                styles[name] = curses.color_pair(i)
+            # The selected row keeps each cell's color on the theme's grey (ANSI bright
+            # black); a blue bar made the colored states hard to read.
+            bar = (15, SELECTED_BG) if curses.COLORS >= 16 else (curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(len(colors) + 1, *bar)
+            selected = curses.color_pair(len(colors) + 1) | curses.A_BOLD
+            # A_DIM is too faint on dark themes, so secondary text takes a light grey instead.
+            if curses.COLORS >= 256:
+                curses.init_pair(len(colors) + 2, 250, -1)
+                styles['dim'] = curses.color_pair(len(colors) + 2)
+                styles['head'] = curses.color_pair(len(colors) + 2) | curses.A_BOLD
+                # Times and the AI name take plain white, since a theme's default text can be greyish.
+                curses.init_pair(len(colors) + 3, 231, -1)
+                styles['meta'] = curses.color_pair(len(colors) + 3)
+            if curses.COLORS >= 16:
+                lit = dict(colors, meta=15, **({'dim': 250} if curses.COLORS >= 256 else {}))
+                for i, (name, color) in enumerate(lit.items(), len(colors) + 4):
+                    curses.init_pair(i, color, SELECTED_BG)
+                    lit_styles[name] = curses.color_pair(i) | curses.A_BOLD
+        keys = {curses.KEY_UP: 'up', curses.KEY_DOWN: 'down', curses.KEY_ENTER: 'enter',
+                curses.KEY_BACKSPACE: 'backspace'}
+        # Wheel buttons are 4 (up) and 5 (down); ncurses builds older than 6 lack button 5.
+        wheel_up = getattr(curses, 'BUTTON4_PRESSED', 0)
+        wheel_down = getattr(curses, 'BUTTON5_PRESSED', 0)
+        clicks = curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        screen.timeout(250)
+        while True:
+            _, rows, warnings = latest['data']
+            warnings = ([latest['error']] if latest['error'] else []) + warnings
+            height, width = screen.getmaxyx()
+            screen.erase()
+            # The last column is left empty: writing there fails on the bottom line.
+            lines = tui_screen(rows, warnings, time.time(), view, width - 1, height)[:height]
+            for y, (segments, lit, _) in enumerate(lines):
+                x = 0
+                for text, style in segments:
+                    try:
+                        screen.addstr(y, x, text, lit_styles.get(style, selected) if lit else styles.get(style, 0))
+                    except curses.error:
+                        pass
+                    x += cell_width(text)
+            screen.refresh()
+            try:
+                key = screen.get_wch()
+            except curses.error:
+                continue
+            if key == curses.KEY_MOUSE:
+                try:
+                    _, _, y, _, state = curses.getmouse()
+                except curses.error:
+                    continue
+                target = lines[y][2] if 0 <= y < len(lines) else None
+                if state & wheel_up:
+                    key = 'up'
+                elif wheel_down and state & wheel_down:
+                    key = 'down'
+                elif state & curses.BUTTON1_DOUBLE_CLICKED:
+                    key = ('double', target)
+                elif state & clicks:
+                    key = ('click', target)
+                else:
+                    continue
+            else:
+                key = keys.get(key, '') if isinstance(key, int) else names.get(key, key)
+            if key and tui_handle(view, key, rows) == 'quit':
+                return
+
+    threading.Thread(target=reader, daemon=True).start()
+    try:
+        curses.wrapper(loop)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""In a terminal, aitop opens a live view of everything -a shows, refreshed
+every second. Keys: up/down or j/k move, Enter opens details, l shows hidden
+records, a switches between both AIs, Claude and Codex, / searches titles, Esc
+clears the search, q quits. With the mouse, a click selects a row, a double click
+opens its details and the wheel moves. --ai, --kind and -l set what it shows first.
+In the live view, NOW is the last line a Claude shell command printed, so for a
+running command it is the step it is on. For a Claude agent it is its latest tool
+call. LEFT appears only while some command
+reports progress.
+
+The table below is printed when the output is not a terminal (pipes, an agent's
+shell) or with --plain.
+Default scope: nearest recorded project; -a reads every project. Entries from aibus
+(MCP servers and other tools that report there) are host-wide.
+Default AI: both, unless --ai narrows it.
+
+Columns:
+  KIND    bg-task / fg-task: a shell command running in the background, or one
+          the agent is waiting on right now. "(timeout)" after a Claude title means
+          a foreground command was moved to the background at its timeout; a Codex
+          command turns bg once its script outlasts the yield time. Plain "task"
+          is a stored Codex command or one whose kind cannot be read. The live
+          view lists bg-task under Background Tasks and the rest under Tasks.
+  LAST  Time since last session/agent/workflow activity or task output.
+  STATE   The state below, with an exit code in parentheses when one is
+          recorded: finished(0), failed(2).
+  UPTIME  Time since an aibus entry's process, a background task or a Claude agent started.
+          A finished agent keeps the time it ran.
+  PROGRESS
+          Last progress a Claude shell command printed near the end of its output:
+          "[n/m]" at the start of a line or "n%" at its end.
+  LEFT    Time left at the rate so far, while the command runs.
+  -       Not applicable or unavailable.
+
+States:
+  in-progress    Recorded running; not a live process check.
+  recent-output Recent transcript activity; not proof of a running process.
+  unknown        Status needs checking; stays visible regardless of age.
+  running        Live aibus entry, Claude output writer, or Codex child process with its thread ID.
+  turn-complete  Last turn ended; not proof the whole task succeeded.
+  finished       Subagent handed its result back, or a background command exited with code 0.
+  failed         A background command exited non-zero, or a session's last turn ended on an API error.
+  ok, warn       What a tool last reported on aibus.
+  late           An aibus entry that runs on a timer missed two runs.
+  gone           An aibus entry whose process ended without reporting an end.
+Completed, finished, stopped, failed and archived records are hidden unless -l is set.
+""")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--ai', choices=['claude', 'codex', 'both'])
+    selection.add_argument('-a', '--all', dest='all_ai', action='store_true', help='Show both AIs, all kinds and every project, including what tools report on aibus')
+    parser.add_argument('--all-projects', action='store_true', help='Read every project, instead of the nearest recorded project (-a implies it)')
+    parser.add_argument('-l', '--list-all', action='store_true', help='Also show completed, stopped, failed and archived records')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Show model, task and parent relationship')
+    parser.add_argument('--plain', action='store_true', help='Print the table even in a terminal, instead of the live view')
+    parser.add_argument('--kind', help='Filter by record kind: agent, workflow, session, task, bg-task, or an aibus source such as mcp')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    args = parser.parse_args(argv)
+    if args.all_ai and args.kind:
+        parser.error('-a selects all kinds; use --ai with --kind to narrow the list')
+    project = Path.cwd().resolve()
+    ai = 'both' if args.all_ai else args.ai or 'both'
+    # -a is the host-wide view, so it is not tied to the terminal's directory.
+    all_projects = args.all_projects or args.all_ai
+    live = (not args.plain and sys.stdin.isatty() and sys.stdout.isatty()
+            and os.environ.get('TERM', 'dumb') != 'dumb')
+    if live:
+        # The live view starts like -a; --ai, --kind and -l only set what it shows first.
+        return run_tui(dict(ai=args.ai or 'both', kind=args.kind, show_all=args.list_all, query='',
+                            typing=None, selected=None, detail=False, offset=0), project)
+    try:
+        now, rows, warnings = collect(ai, project, all_projects, args.list_all,
+                                      args.all_ai or args.kind is not None,
+                                      args.kind)
+    except KeyboardInterrupt:
+        return
+    render(rows, args.verbose, args.list_all, now)
+    for warning in warnings:
+        print('WARNING: ' + clean(warning, 300), file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()
