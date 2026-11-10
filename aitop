@@ -17,7 +17,7 @@ import sys
 import time
 import unicodedata
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
 READ_CAP = 1024 * 1024
 # The live view reads everything every second, and most transcripts stop changing
@@ -948,10 +948,12 @@ def progress(r):
 
 
 def render(rows, verbose, show_all, now):
-    kind_order = {'session': 0, 'workflow': 1, 'agent': 2, 'task': 3, 'mcp': 4}
+    # As in the live view: aibus rows first, MCP before the other sources, then Claude and Codex work.
+    kind_order = {'session': 2, 'workflow': 3, 'agent': 4, 'task': 5}
     shown = sorted((r for r in rows if show_all or
                     (not r.get('archived') and r['state'] not in TERMINAL_STATES)),
-                   key=lambda r: (kind_order.get(r['kind'], 5), r['ai'],
+                   key=lambda r: (0 if r['kind'] == 'mcp' else 1 if r.get('source') else kind_order.get(r['kind'], 6),
+                                  r['kind'], r['ai'],
                                   0 if r.get('quiet') else -r['updated'],
                                   r['title'], r['id']))
     print(f"=== {time.strftime('%H:%M:%S')} | {len(shown)} shown | {len(rows)-len(shown)} hidden (-l) ===")
@@ -1002,7 +1004,7 @@ def collect(ai, project, all_projects, include_ended, bus, kind=None):
 
 
 # Live view. Drawing is kept apart from curses so tests can read the lines.
-# MCP servers stay up all session, so they sit on top and new work appears under them.
+# What aibus reports sits on top, MCP first, and Claude and Codex work follows under it.
 TUI_GROUPS = [('mcp', 'MCP'), ('task', 'Tasks'), ('bg-task', 'Background Tasks'), ('session', 'Sessions'),
               ('workflow', 'Workflows'), ('agent', 'Agents')]
 
@@ -1018,15 +1020,10 @@ def has_kind(r, kind):
 
 
 def tui_groups(rows):
-    """TUI_GROUPS plus one group per other aibus source, after the background tasks."""
+    """TUI_GROUPS with one group per other aibus source right under MCP, by name."""
     names = {tui_group(r): r.get('source') or tui_group(r) for r in rows}
     extra = sorted(set(names) - set(dict(TUI_GROUPS)), key=lambda kind: (names[kind], kind))
-    groups = []
-    for kind, label in TUI_GROUPS:
-        groups.append((kind, label))
-        if kind == 'bg-task':
-            groups += [(kind, names[kind]) for kind in extra]
-    return groups
+    return TUI_GROUPS[:1] + [(kind, names[kind]) for kind in extra] + TUI_GROUPS[1:]
 TUI_ICONS = {'running': ('●', 'ok'), 'in-progress': ('◐', 'ok'), 'recent-output': ('○', 'info'),
              'unknown': ('?', 'warn'), 'turn-complete': ('✓', 'dim'), 'finished': ('✓', 'dim'),
              'stopped': ('■', 'dim'), 'failed': ('✗', 'bad'),

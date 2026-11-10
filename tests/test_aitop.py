@@ -128,7 +128,7 @@ class AibusTests(unittest.TestCase):
                     _, found, _ = status.collect('both', Path('/x'), True, False, True, kind)
                     self.assertEqual([r['id'] for r in found], ids)
 
-    def test_each_source_gets_a_group_after_background_tasks(self):
+    def test_aibus_sources_sit_under_mcp_above_agent_work(self):
         rows = [status.row('claude', 'task', 'b1', 'p', 1990, 'running', 'cmd', mode='bg'),
                 status.row('codex', 'xverify', 'r1', '', 1990, 'running', 'verify', source='xverify'),
                 status.row('-', 'mac', 'slow', '', 1990, 'warn', 'slow-log', source='mac'),
@@ -137,9 +137,21 @@ class AibusTests(unittest.TestCase):
                 status.row('claude', 'session', 's1', 'p', 1999, 'recent-output', 'work')]
         lines = status.tui_screen(rows, [], 2000, view(), 120, 30)
         groups = [text(line).strip() for line in lines if line[0][0][1] == 'group']
-        self.assertEqual(groups, ['MCP', 'Background Tasks', 'mac', 'task', 'xverify', 'Sessions'])
+        self.assertEqual(groups, ['MCP', 'mac', 'task', 'xverify', 'Background Tasks', 'Sessions'])
         texts = [text(line) for line in lines]
         self.assertTrue(any(t[2:].startswith('! warn') for t in texts), texts)
+
+    def test_the_table_lists_aibus_rows_first_like_the_live_view(self):
+        rows = [status.row('claude', 'session', 's1', 'p', 1999, 'recent-output', 'work'),
+                status.row('aibus', 'xverify', 'r1', '', 1990, 'running', 'verify', source='xverify'),
+                status.row('claude', 'task', 'b1', 'p', 1990, 'running', 'cmd', mode='bg'),
+                status.row('aibus', 'mcp', 'm1', '', 0, 'running', 'wiki', quiet=True, source='mcp'),
+                status.row('aibus', 'mac', 'slow', '', 1990, 'ok', 'slow-log', source='mac')]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status.render(rows, False, False, 2000)
+        listed = [line.split()[2] for line in output.getvalue().splitlines()[3:]]
+        self.assertEqual(listed, ['m1', 'slow', 'r1', 's1', 'b1'])
 
 
 class ClaudeSessionTests(unittest.TestCase):

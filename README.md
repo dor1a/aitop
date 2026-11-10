@@ -18,12 +18,12 @@ Read-only: it never starts, resumes or stops anything.
   STATE             NOW                        UPTIME     LAST        AI      NAME / TITLE
  MCP
 ▶ ● running                                    1h12m                  aibus   wiki MCP
- Background Tasks
-  ● running         [3/4] codex exec in pyth…  2m10s      now         claude  verify the linter
  mac
   ! warn            swap 4970/6144M pressure…             2m00s ago   aibus   mac-slow-log
  xverify
   ● running         reproducing finding 3 in…  2m02s      2s ago      aibus   webapp 3f2a91c
+ Background Tasks
+  ● running         [3/4] codex exec in pyth…  2m10s      now         claude  verify the linter
  Sessions
   ○ recent-output                                         12s ago     claude  status router
   ◐ in-progress                                           40s ago     codex   review aibus
@@ -62,7 +62,7 @@ flowchart LR
 | Claude Code transcripts | Sessions, workflows, subagents and the shell commands they ran in the background |
 | Codex SQLite and rollouts | Sessions and stored command records |
 | `lsof`, `ps` | Whether a Claude background command is still writing, and which Codex commands run now |
-| `aibus ls --json` | One group per source, `mcp` on top and the rest after the background tasks, with `aibus` in the `AI` column |
+| `aibus ls --json` | One group per source, all above the Claude and Codex groups with `mcp` first, and `aibus` in the `AI` column |
 
 A transcript is parsed again only when its size or modification time changes, so finished sessions and agents cost almost nothing between passes.
 
@@ -125,7 +125,7 @@ aibus put backup nightly --title "nightly backup" --ai cron --pid $$
 
 | aibus field | aitop column |
 | -- | -- |
-| `source` | The group name. `mcp` is pinned to the top |
+| `source` | The group name. aibus groups sit above Claude and Codex work, `mcp` first |
 | `ai` | The details pane. The `AI` column shows `aibus`, and `a` and `--ai` still filter by this field |
 | `status` | `STATE`, with `exit_code` in parentheses |
 | `now` | `NOW` |
