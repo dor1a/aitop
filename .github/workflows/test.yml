@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.9"
+          - "3.14"
+    container: python:${{ matrix.python }}-slim
+    steps:
+      - uses: actions/checkout@v7
+      # ps and lsof back the live process tests.
+      - run: apt-get update && apt-get install -y --no-install-recommends procps lsof
+      - run: python -m unittest discover -s tests -v
