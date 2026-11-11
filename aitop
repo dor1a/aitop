@@ -1236,10 +1236,10 @@ def tui_screen(rows, warnings, now, view, width, height):
     if view['typing'] is not None:
         hint = f' /{view["typing"]}▏  Enter apply  Esc cancel'
     else:
-        hints = (['↑↓ PgUp PgDn move', '⏎ details', toggle, 'a AI', '/ search']
+        hints = (['↑↓ move', '⏎ details', toggle, 'a AI', '/ search']
                  + (['Esc clear search'] if view['query'] else []) + ['q quit'])
         # On a narrow pane the hints give way, least needed first, so l and its count stay.
-        for old, new in [('↑↓ PgUp PgDn move', '↑↓ move'), ('/ search', None), ('a AI', None),
+        for old, new in [('/ search', None), ('a AI', None),
                          ('⏎ details', None), ('Esc clear search', None), ('↑↓ move', None), ('q quit', None)]:
             if cell_width(' ' + '  '.join(hints)) <= width - cell_width(count):
                 break

@@ -30,7 +30,7 @@ Read-only: it never starts, resumes or stops anything.
   ○ recent-output                                         12s ago     claude  status router
   ◐ in-progress                                           40s ago     codex   review aibus
 
- ↑↓ PgUp PgDn move  ⏎ details  l show 14 hidden  a AI  / search  q quit                         6 shown
+ ↑↓ move  ⏎ details  l show 14 hidden  a AI  / search  q quit                                   6 shown
 ```
 
 ## Install
