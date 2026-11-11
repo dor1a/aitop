@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/logo.svg" alt="" width="96">
+
 # aitop
 
 **A live view of what Claude Code and Codex are running on this machine**
@@ -7,7 +9,7 @@
 Sessions, workflows, subagents and background shell commands in one screen, refreshed every second.<br>
 Read-only: it never starts, resumes or stops anything.
 
-[![macOS | Linux](https://img.shields.io/badge/macOS%20%7C%20Linux-supported-555555)](#install)
+[![macOS | Linux | WSL](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20WSL-supported-555555)](#install)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](aitop)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -30,6 +32,108 @@ Read-only: it never starts, resumes or stops anything.
 
  ↑↓ move  ⏎ details  l hidden  a AI  / search  q quit                                           6 shown
 ```
+
+## Install
+
+macOS, with Homebrew:
+
+```sh
+brew install dor1a/tap/aitop
+```
+
+Linux and WSL, from a clone:
+
+```sh
+git clone https://github.com/dor1a/aitop.git
+cd aitop
+./install.sh
+```
+
+`install.sh` links `aitop` into `~/.local/bin` and says so when that folder is not on your `PATH`. If it is not, add it in your shell's rc file:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To update, run `brew upgrade aitop`, or `git pull` in the clone.
+
+aitop needs Python 3.9 or later and uses only the standard library, so the macOS `/usr/bin/python3` is enough.
+
+`lsof` and `ps` are optional: without them a Claude background command shows as `unknown` and live Codex commands are not listed. [aibus](https://github.com/dor1a/aibus) is optional too; without it there are simply no aibus groups.
+
+## Usage
+
+In a terminal, `aitop` opens the live view. Rows are grouped, each with a colored state, `NOW` (the last line it printed, or for a Claude subagent its latest tool call) and a details pane for the selected row. The live view reads both AIs and every project; `--ai`, `--kind` and `-l` only set what it shows first.
+
+| Key | Action |
+| -- | -- |
+| ↑ ↓, `j` `k` or the mouse wheel | Move the selection |
+| Click | Select a row |
+| Enter or double click | Open or close details |
+| `l` | Show or hide ended records |
+| `a` | Switch between both AIs, Claude and Codex |
+| `/` | Search titles and IDs. Esc while typing cancels the edit; Esc afterwards clears the search |
+| `q` | Quit |
+
+While the view runs it takes the mouse, so selecting text needs the terminal's override: hold Option while dragging in iTerm2, or turn off View > Allow Mouse Reporting in Terminal.app.
+
+When the output is not a terminal, or with `--plain`, the table is printed instead, so pipes and an agent's own shell get plain text:
+
+```sh
+aitop                     # live view
+aitop --plain -a          # table: both AIs, every record kind, every project
+aitop --plain -al         # the same, including ended records
+aitop --plain --kind mcp  # only what aibus lists under mcp
+```
+
+| Option | Effect |
+| -- | -- |
+| `-a` | Both AIs, every kind, every project, plus aibus entries |
+| `--ai claude\|codex\|both` | One AI. In the table, the scope stays on the nearest recorded project unless `--all-projects` widens it |
+| `--kind KIND` | `session`, `workflow`, `agent`, `task`, `bg-task`, or an aibus source such as `mcp` |
+| `-l` | Include completed, stopped, failed and archived records |
+| `-v` | Add model, task and parent IDs to the table |
+
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select custom profiles. `aitop --help` lists every column and state.
+
+### Showing your own tools
+
+Anything that reports on aibus appears in aitop with no change to aitop:
+
+```sh
+aibus put backup nightly --title "nightly backup" --ai cron --pid $$
+```
+
+| aibus field | aitop column |
+| -- | -- |
+| `source` | The group name. aibus groups sit above Claude and Codex work, `mcp` first |
+| `ai` | The details pane. The `AI` column shows `aibus`, and `a` and `--ai` still filter by this field |
+| `status` | `STATE`, with `exit_code` in parentheses |
+| `now` | `NOW` |
+| `progress` | `PROGRESS` in the table, `N/M` in the details |
+| `started` | `UPTIME`, while the entry has a live process or is running |
+| `updated` | `LAST` |
+| `links`, `host` | The details pane |
+
+An entry whose process ended without reporting shows as `gone` and stays in view, and a scheduled job that missed two runs shows as `late`. Finished and failed entries join the ended records that `l` shows.
+
+aitop reads with `aibus ls --json --reader aitop`, so `aibus status` shows when aitop last read. If a tool reports but aitop shows nothing, that line tells whether aitop is reading at all.
+
+### What the rows mean
+
+| State | Meaning |
+| -- | -- |
+| `running` | A live process: a Claude output writer, a Codex command with its thread ID, or an aibus entry |
+| `in-progress` | Recorded as running. Not a live process check; after four minutes without updates it becomes `unknown` |
+| `recent-output` | Recent transcript activity, not proof of a running process |
+| `unknown` | Needs checking, and stays visible regardless of age |
+| `turn-complete` | The last turn ended. Not proof that the whole task succeeded |
+| `finished`, `failed` | A subagent handed its result back, or a command exited with code 0 or non-zero |
+| `ok`, `warn`, `late`, `gone` | From aibus: what a tool reported, a missed schedule, a process that ended without reporting |
+
+For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 200 stored command records per thread.
+
+Titles use command descriptions and program names, never arguments or output. The details pane shows the full command, up to five lines; the environment that names a Codex thread is never shown.
 
 ## How it works
 
@@ -66,95 +170,21 @@ flowchart LR
 
 A transcript is parsed again only when its size or modification time changes, so finished sessions and agents cost almost nothing between passes.
 
-## Install
-
-Python 3.9 or later on macOS or Linux, standard library only.
+## Uninstall
 
 ```sh
-git clone https://github.com/dor1a/aitop.git
-cd aitop
-./install.sh
+brew uninstall aitop
 ```
 
-`install.sh` links `aitop` into `~/.local/bin`. To update, `git pull` in the clone.
-
-`lsof` and `ps` are optional: without them a Claude background command shows as `unknown` and live Codex commands are not listed. [aibus](https://github.com/dor1a/aibus) is optional too; without it there are simply no aibus groups.
-
-## Usage
-
-In a terminal, `aitop` opens the live view. Rows are grouped, each with a colored state, the last line it printed (`NOW`) and a details pane for the selected row.
-
-| Key | Action |
-| -- | -- |
-| ↑ ↓, `j` `k` or the mouse wheel | Move the selection |
-| Click | Select a row |
-| Enter or double click | Open or close details |
-| `l` | Show or hide ended records |
-| `a` | Switch between both AIs, Claude and Codex |
-| `/` | Search titles and IDs; Esc clears the search |
-| `q` | Quit |
-
-While the view runs it takes the mouse, so selecting text needs the terminal's override: hold Option while dragging in iTerm2, or turn off View > Allow Mouse Reporting in Terminal.app.
-
-When the output is not a terminal, or with `--plain`, the table is printed instead, so pipes and an agent's own shell get plain text:
+For a clone, remove the link and then the clone:
 
 ```sh
-aitop                     # live view
-aitop --plain -a          # table: both AIs, every record kind, every project
-aitop --plain -al         # the same, including ended records
-aitop --plain --kind mcp  # only what aibus lists under mcp
+rm ~/.local/bin/aitop
 ```
 
-| Option | Effect |
-| -- | -- |
-| `-a` | Both AIs, every kind, every project, plus aibus entries |
-| `--ai claude\|codex\|both` | One AI. The scope stays on the nearest recorded project unless `--all-projects` widens it |
-| `--kind KIND` | `session`, `workflow`, `agent`, `task`, `bg-task`, or an aibus source such as `mcp` |
-| `-l` | Include completed, stopped, failed and archived records |
-| `-v` | Add model, task and parent IDs to the table |
+aitop writes no files of its own, so nothing else is left behind.
 
-`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select custom profiles. `aitop --help` lists every column and state.
-
-## Showing your own tools
-
-Anything that reports on aibus appears in aitop with no change to aitop:
-
-```sh
-aibus put backup nightly --title "nightly backup" --ai cron --pid $$
-```
-
-| aibus field | aitop column |
-| -- | -- |
-| `source` | The group name. aibus groups sit above Claude and Codex work, `mcp` first |
-| `ai` | The details pane. The `AI` column shows `aibus`, and `a` and `--ai` still filter by this field |
-| `status` | `STATE`, with `exit_code` in parentheses |
-| `now` | `NOW` |
-| `progress` | `PROGRESS` in the table, `N/M` in the details |
-| `started` | `UPTIME`, while the entry has a live process or is running |
-| `updated` | `LAST` |
-| `links`, `host` | The details pane |
-
-An entry whose process ended without reporting shows as `gone` and stays in view, and a scheduled job that missed two runs shows as `late`. Finished and failed entries join the ended records that `l` shows.
-
-aitop reads with `aibus ls --json --reader aitop`, so `aibus status` shows when aitop last read. If a tool reports but aitop shows nothing, that line tells whether aitop is reading at all.
-
-## What the rows mean
-
-| State | Meaning |
-| -- | -- |
-| `running` | A live process: a Claude output writer, a Codex command with its thread ID, or an aibus entry |
-| `in-progress` | Recorded as running. Not a live process check; after four minutes without updates it becomes `unknown` |
-| `recent-output` | Recent transcript activity, not proof of a running process |
-| `unknown` | Needs checking, and stays visible regardless of age |
-| `turn-complete` | The last turn ended. Not proof that the whole task succeeded |
-| `finished`, `failed` | A subagent handed its result back, or a command exited with code 0 or non-zero |
-| `ok`, `warn`, `late`, `gone` | From aibus: what a tool reported, a missed schedule, a process that ended without reporting |
-
-For Claude, a shell command is listed only when the transcript reports it as a background command, and its output file's end marker supplies the exit code. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 200 stored command records per thread.
-
-Titles use command descriptions and program names, never arguments or output. The details pane shows the full command, up to five lines; the environment that names a Codex thread is never shown.
-
-## Checks
+## Development
 
 The tests use only the standard library. Some need Linux `ps` and `lsof`, so run them in a container to get all of them:
 
@@ -163,8 +193,10 @@ docker run --rm -v "$PWD:/w:ro" -w /w -e PYTHONDONTWRITEBYTECODE=1 python:3.14-s
   sh -c 'apt-get -qq update && apt-get -qq install -y procps lsof >/dev/null && python -m unittest discover -s tests'
 ```
 
+## Not affiliated
+
+aitop is a personal tool and is not affiliated with Anthropic or OpenAI. Public tools with the same name exist; this one is unrelated to them.
+
 ## License
 
 [MIT](LICENSE)
-
-Public tools with the same name exist; this one is unrelated to them.
