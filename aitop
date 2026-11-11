@@ -17,8 +17,13 @@ import sys
 import time
 import unicodedata
 
-__version__ = '0.1.1'
+__version__ = '0.1.2'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
+# Hidden records stop being listed a day after their last update; this is a view of
+# what runs now, and older history ran to hundreds of rows behind l.
+HIDDEN_KEEP = 24 * 3600
+# Stored Codex commands read per thread for -l, newest first.
+CODEX_COMMANDS = 20
 READ_CAP = 1024 * 1024
 # The live view reads everything every second, and most transcripts stop changing
 # once their session or agent ends. Parsed reads are kept here and reused while the
@@ -737,8 +742,8 @@ class CodexReader:
                           json_extract(item_json,'$.command') AS command,
                           json_extract(item_json,'$.exitCode') AS exit_code
                         FROM thread_items WHERE thread_id=? AND item_type='commandExecution'
-                        ORDER BY rollout_ordinal DESC LIMIT 200
-                    ''', (thread['id'],)))
+                        ORDER BY rollout_ordinal DESC LIMIT ?
+                    ''', (thread['id'], CODEX_COMMANDS)))
                 return result
         except (sqlite3.Error, OSError):
             self.warnings.append('Codex command history unavailable; exit codes cannot be read.')
@@ -768,12 +773,17 @@ class CodexReader:
                     'failed': 'failed'}.get(status, 'unknown')
                 if not include_ended and state in TERMINAL_STATES:
                     continue
-                updated = timestamp(command['completed_ms'] or command['started_ms'])
+                owner = owners[command['thread_id']]
+                # Without command times the thread's last update stands in, so a fresh
+                # command is not taken for one older than HIDDEN_KEEP and dropped.
+                updated = timestamp(command['completed_ms'] or command['started_ms']) or max(
+                    timestamp(owner.get('updated_at_ms') or owner.get('updated_at')),
+                    mtime(Path(owner['rollout_path'])) if owner.get('rollout_path') else 0)
                 result.append(row('codex', 'task', command['item_id'],
                                   owners[command['thread_id']]['cwd'], updated, state,
                                   command_program(command['command']), parent=command['thread_id'],
                                   command=command_body(command['command']), os_pid=None, process_id=command['process_id'], uptime=None,
-                                  exit_code=code, evidence='stored commandExecution metadata; latest 200 commands per thread'))
+                                  exit_code=code, evidence=f'stored commandExecution metadata; latest {CODEX_COMMANDS} commands per thread'))
         return result
 
     def read(self, project, all_projects, now, include_ended=False):
@@ -947,11 +957,18 @@ def progress(r):
     return '-' if r.get('progress') is None else f"{int(r['progress'])}%"
 
 
+def hidden_by_default(r):
+    """Ended and archived records, and aibus entries whose last report was ok; `l` and -l show them.
+
+    A scheduled check that reports ok has nothing to say until it turns warn or late.
+    """
+    return bool(r.get('archived')) or r['state'] in TERMINAL_STATES or (r['ai'] == 'aibus' and r['state'] == 'ok')
+
+
 def render(rows, verbose, show_all, now):
     # As in the live view: aibus rows first, MCP before the other sources, then Claude and Codex work.
     kind_order = {'session': 2, 'workflow': 3, 'agent': 4, 'task': 5}
-    shown = sorted((r for r in rows if show_all or
-                    (not r.get('archived') and r['state'] not in TERMINAL_STATES)),
+    shown = sorted((r for r in rows if show_all or not hidden_by_default(r)),
                    key=lambda r: (0 if r['kind'] == 'mcp' else 1 if r.get('source') else kind_order.get(r['kind'], 6),
                                   r['kind'], r['ai'],
                                   0 if r.get('quiet') else -r['updated'],
@@ -998,6 +1015,7 @@ def collect(ai, project, all_projects, include_ended, bus, kind=None):
         warnings.extend(bus_warnings)
     if kind:
         rows = [r for r in rows if has_kind(r, kind)]
+    rows = [r for r in rows if not (hidden_by_default(r) and now - r['updated'] > HIDDEN_KEEP)]
     for key in CACHE.keys() - USED:
         del CACHE[key]
     return now, rows, warnings
@@ -1065,7 +1083,7 @@ def tui_visible(rows, view, show_all=None):
     show_all = view['show_all'] if show_all is None else show_all
     query = view['query'].lower()
     keep = [r for r in rows
-            if (show_all or (not r.get('archived') and r['state'] not in TERMINAL_STATES))
+            if (show_all or not hidden_by_default(r))
             and view['ai'] in ('both', r['ai'], r.get('bus_ai'))
             and (not view['kind'] or has_kind(r, view['kind']))
             and (not query or query in f"{r['title']} {r['id']}".lower())]
@@ -1211,19 +1229,30 @@ def tui_screen(rows, warnings, now, view, width, height):
         bottom += [(line, False, None) for line in tui_detail(shown[keys.index(view['selected'])], width)]
     for warning in warnings[:2]:
         bottom.append(([(fit(' ! ' + clean(warning, 300), width), 'warn')], False, None))
-    hidden = len(tui_visible(rows, view, show_all=True)) - len(shown)
-    count = f'{len(shown)} shown' + (f', {hidden} hidden ' if hidden else ' ')
+    # The hidden count sits next to its key, so it stays readable once l shows them.
+    hidden = len(tui_visible(rows, view, show_all=True)) - len(tui_visible(rows, view, show_all=False))
+    toggle = f"l {'hide' if view['show_all'] else 'show'} {hidden} hidden"
+    count = f'{len(shown)} shown '
     if view['typing'] is not None:
         hint = f' /{view["typing"]}▏  Enter apply  Esc cancel'
     else:
-        hint = (' ↑↓ move  ⏎ details  l hidden  a AI  / search  '
-                + ('Esc clear search  ' if view['query'] else '') + 'q quit')
+        hints = (['↑↓ PgUp PgDn move', '⏎ details', toggle, 'a AI', '/ search']
+                 + (['Esc clear search'] if view['query'] else []) + ['q quit'])
+        # On a narrow pane the hints give way, least needed first, so l and its count stay.
+        for old, new in [('↑↓ PgUp PgDn move', '↑↓ move'), ('/ search', None), ('a AI', None),
+                         ('⏎ details', None), ('Esc clear search', None), ('↑↓ move', None), ('q quit', None)]:
+            if cell_width(' ' + '  '.join(hints)) <= width - cell_width(count):
+                break
+            if old in hints:
+                hints[hints.index(old):hints.index(old) + 1] = [new] if new else []
+        hint = ' ' + '  '.join(hints)
     bottom.append(([(fit(hint, width - cell_width(count)) + count, 'bar')], False, None))
     # On a short screen the details and warnings give way from the bottom; the key bar and one row stay.
     while len(bottom) > 1 and len(top) + 1 + len(bottom) > height:
         bottom.pop(-2)
 
     room = max(1, height - len(top) - len(bottom))
+    view['page'] = room
     if mark is not None:
         if mark < view['offset']:
             view['offset'] = max(0, mark - 1)  # keep the group label above the first row
@@ -1259,7 +1288,8 @@ def clip(segments, width):
 def tui_handle(view, key, rows):
     """Apply one key and return 'quit' to leave.
 
-    A key is a character, 'up', 'down', 'enter', 'esc', 'backspace', or a mouse
+    A key is a character, 'up', 'down', 'pgup', 'pgdn', 'home', 'end', 'enter',
+    'esc', 'backspace', or a mouse
     event: ('click', row key) or ('double', row key), with None off the rows.
     """
     if isinstance(key, tuple):
@@ -1283,11 +1313,15 @@ def tui_handle(view, key, rows):
         return None
     if key in ('q', 'Q'):
         return 'quit'
-    if key in ('up', 'k', 'down', 'j'):
+    moves = {'up': -1, 'k': -1, 'down': 1, 'j': 1,
+             # A page keeps one row of the last screen in view; group labels make it a little less.
+             'pgup': -max(1, view.get('page', 10) - 1), 'pgdn': max(1, view.get('page', 10) - 1)}
+    if key in moves or key in ('home', 'end'):
         keys = [tui_key(r) for r in tui_visible(rows, view)]
         if keys:
             i = keys.index(view['selected']) if view['selected'] in keys else 0
-            view['selected'] = keys[max(0, min(len(keys) - 1, i + (-1 if key in ('up', 'k') else 1)))]
+            i = 0 if key == 'home' else len(keys) - 1 if key == 'end' else i + moves[key]
+            view['selected'] = keys[max(0, min(len(keys) - 1, i))]
     elif key == 'enter':
         view['detail'] = not view['detail']
     elif key == 'l':
@@ -1355,7 +1389,8 @@ def run_tui(view, project):
                     curses.init_pair(i, color, SELECTED_BG)
                     lit_styles[name] = curses.color_pair(i) | curses.A_BOLD
         keys = {curses.KEY_UP: 'up', curses.KEY_DOWN: 'down', curses.KEY_ENTER: 'enter',
-                curses.KEY_BACKSPACE: 'backspace'}
+                curses.KEY_BACKSPACE: 'backspace', curses.KEY_PPAGE: 'pgup', curses.KEY_NPAGE: 'pgdn',
+                curses.KEY_HOME: 'home', curses.KEY_END: 'end'}
         # Wheel buttons are 4 (up) and 5 (down); ncurses builds older than 6 lack button 5.
         wheel_up = getattr(curses, 'BUTTON4_PRESSED', 0)
         wheel_down = getattr(curses, 'BUTTON5_PRESSED', 0)
@@ -1416,7 +1451,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""In a terminal, aitop opens a live view of everything -a shows, refreshed
-every second. Keys: up/down or j/k move, Enter opens details, l shows hidden
+every second. Keys: up/down or j/k move, Page Up and Page Down move a screen,
+Home and End go to the first and last row, Enter opens details, l shows hidden
 records, a switches between both AIs, Claude and Codex, / searches titles, Esc
 clears the search, q quits. With the mouse, a click selects a row, a double click
 opens its details and the wheel moves. --ai, --kind and -l set what it shows first.
@@ -1460,7 +1496,9 @@ States:
   ok, warn       What a tool last reported on aibus.
   late           An aibus entry that runs on a timer missed two runs.
   gone           An aibus entry whose process ended without reporting an end.
-Completed, finished, stopped, failed and archived records are hidden unless -l is set.
+Completed, finished, stopped, failed and archived records, and aibus entries that
+last reported ok, are hidden unless -l is set, and are not listed at all once
+their last update is more than 24 hours old.
 """)
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--ai', choices=['claude', 'codex', 'both'])

@@ -30,7 +30,7 @@ Read-only: it never starts, resumes or stops anything.
   ○ recent-output                                         12s ago     claude  status router
   ◐ in-progress                                           40s ago     codex   review aibus
 
- ↑↓ move  ⏎ details  l hidden  a AI  / search  q quit                                           6 shown
+ ↑↓ PgUp PgDn move  ⏎ details  l show 14 hidden  a AI  / search  q quit                         6 shown
 ```
 
 ## Install
@@ -68,9 +68,11 @@ In a terminal, `aitop` opens the live view. Rows are grouped, each with a colore
 | Key | Action |
 | -- | -- |
 | ↑ ↓, `j` `k` or the mouse wheel | Move the selection |
+| Page Up, Page Down | Move a screen at a time |
+| Home, End | Go to the first or last row |
 | Click | Select a row |
 | Enter or double click | Open or close details |
-| `l` | Show or hide ended records |
+| `l` | Show or hide hidden records from the last 24 hours. The key bar says how many there are |
 | `a` | Switch between both AIs, Claude and Codex |
 | `/` | Search titles and IDs. Esc while typing cancels the edit; Esc afterwards clears the search |
 | `q` | Quit |
@@ -91,7 +93,7 @@ aitop --plain --kind mcp  # only what aibus lists under mcp
 | `-a` | Both AIs, every kind, every project, plus aibus entries |
 | `--ai claude\|codex\|both` | One AI. In the table, the scope stays on the nearest recorded project unless `--all-projects` widens it |
 | `--kind KIND` | `session`, `workflow`, `agent`, `task`, `bg-task`, or an aibus source such as `mcp` |
-| `-l` | Include completed, stopped, failed and archived records |
+| `-l` | Include completed, stopped, failed and archived records, and aibus entries that last reported `ok`. These are listed for 24 hours after their last update |
 | `-v` | Add model, task and parent IDs to the table |
 
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` select custom profiles. `aitop --help` lists every column and state.
@@ -115,7 +117,7 @@ aibus put backup nightly --title "nightly backup" --ai cron --pid $$
 | `updated` | `LAST` |
 | `links`, `host` | The details pane |
 
-An entry whose process ended without reporting shows as `gone` and stays in view, and a scheduled job that missed two runs shows as `late`. Finished and failed entries join the ended records that `l` shows.
+An entry whose process ended without reporting shows as `gone` and stays in view, and a scheduled job that missed two runs shows as `late`. Finished and failed entries join the ended records that `l` shows, and so does an entry whose last report was `ok`: a scheduled check that is fine has nothing to say until it turns `warn` or `late`.
 
 aitop reads with `aibus ls --json --reader aitop`, so `aibus status` shows when aitop last read. If a tool reports but aitop shows nothing, that line tells whether aitop is reading at all.
 
@@ -131,7 +133,7 @@ aitop reads with `aibus ls --json --reader aitop`, so `aibus status` shows when 
 | `finished`, `failed` | A subagent handed its result back, or a command exited with code 0 or non-zero |
 | `ok`, `warn`, `late`, `gone` | From aibus: what a tool reported, a missed schedule, a process that ended without reporting |
 
-For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 200 stored command records per thread.
+For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 20 stored command records per thread.
 
 Titles use command descriptions and program names, never arguments or output. The details pane shows the full command, up to five lines; the environment that names a Codex thread is never shown.
 

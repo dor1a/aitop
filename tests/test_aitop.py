@@ -6,8 +6,10 @@ import os
 from contextlib import redirect_stdout
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -36,6 +38,20 @@ class AibusTests(unittest.TestCase):
              patch.object(status.subprocess, 'run') as call:
             self.assertEqual(status.aibus_rows(0), ([], []))
         call.assert_not_called()
+
+    def test_ok_entries_wait_behind_l(self):
+        # A daily check that reported ok stayed on screen all day with that morning's text.
+        rows, _ = self.read(bus(dict(source='mac', id='todo-due', state='ok', status='ok', updated=1990),
+                                dict(source='mac', id='slow-log', state='warn', status='warn', updated=1990),
+                                dict(source='mac', id='stuck', state='ok', status='late', updated=1000)))
+        shown = lambda v: sorted(r['id'] for r in status.tui_visible(rows, v))
+        self.assertEqual(shown(view()), ['slow-log', 'stuck'])
+        self.assertEqual(shown(view(show_all=True)), ['slow-log', 'stuck', 'todo-due'])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            status.render(rows, False, False, 2000)
+        self.assertIn('| 2 shown | 1 hidden (-l) ===', out.getvalue())
+        self.assertNotIn('todo-due', out.getvalue())
 
     def test_entries_become_rows_by_source(self):
         rows, warnings = self.read(bus(
@@ -110,9 +126,9 @@ class AibusTests(unittest.TestCase):
                 self.assertEqual(self.read(subprocess.CompletedProcess([], 0, listing)), ([], []))
 
     def test_sources_keep_their_names_and_filters(self):
-        rows, _ = self.read(bus(dict(source='task', id='a', status='ok'),
-                                dict(source='bus-task', id='b', status='ok'),
-                                dict(source='bus-foo', id='c', status='ok'),
+        rows, _ = self.read(bus(dict(source='task', id='a', status='warn'),
+                                dict(source='bus-task', id='b', status='warn'),
+                                dict(source='bus-foo', id='c', status='warn'),
                                 dict(source='bg-task', id='d', status='running')))
         self.assertEqual(len({r['kind'] for r in rows}), 4)
         lines = status.tui_screen(rows, [], 2000, view(), 120, 30)
@@ -146,7 +162,7 @@ class AibusTests(unittest.TestCase):
                 status.row('aibus', 'xverify', 'r1', '', 1990, 'running', 'verify', source='xverify'),
                 status.row('claude', 'task', 'b1', 'p', 1990, 'running', 'cmd', mode='bg'),
                 status.row('aibus', 'mcp', 'm1', '', 0, 'running', 'wiki', quiet=True, source='mcp'),
-                status.row('aibus', 'mac', 'slow', '', 1990, 'ok', 'slow-log', source='mac')]
+                status.row('aibus', 'mac', 'slow', '', 1990, 'warn', 'slow-log', source='mac')]
         output = io.StringIO()
         with redirect_stdout(output):
             status.render(rows, False, False, 2000)
@@ -543,6 +559,60 @@ class ClaudeTaskTests(unittest.TestCase):
                 self.assertEqual(status.task_rows(project, 0), [])
 
 
+class HistoryLimitTests(unittest.TestCase):
+    def test_hidden_records_older_than_a_day_are_not_listed(self):
+        now = time.time()
+        rows = [status.row('aibus', 'xverify', 'old', '', now - status.HIDDEN_KEEP - 60, 'finished', 'old run',
+                           source='xverify', bus_ai='codex'),
+                status.row('aibus', 'xverify', 'new', '', now - 3600, 'finished', 'new run',
+                           source='xverify', bus_ai='codex'),
+                # Rows that stay in view keep showing however old they are.
+                status.row('aibus', 'xverify', 'stuck', '', now - 3 * 86400, 'running', 'still running',
+                           source='xverify', bus_ai='codex'),
+                status.row('aibus', 'mac', 'odd', '', now - 3 * 86400, 'unknown', 'needs a look',
+                           source='mac', bus_ai='-')]
+        with tempfile.TemporaryDirectory() as home, \
+             patch.dict(os.environ, CLAUDE_CONFIG_DIR=home, CODEX_HOME=home), \
+             patch.object(status, 'aibus_rows', return_value=(rows, [])):
+            _, found, _ = status.collect('both', Path('/x'), True, True, True)
+        self.assertEqual(sorted(r['id'] for r in found), ['new', 'odd', 'stuck'])
+
+    def test_codex_reads_only_the_latest_commands_of_each_thread(self):
+        with tempfile.TemporaryDirectory() as root:
+            db = sqlite3.connect(Path(root) / 'thread_history_1.sqlite')
+            db.execute('CREATE TABLE thread_items (thread_id TEXT, item_id TEXT, item_type TEXT, '
+                       'item_json TEXT, rollout_ordinal INTEGER)')
+            item = json.dumps({'command': 'ls', 'status': 'completed', 'exitCode': 0})
+            db.executemany('INSERT INTO thread_items VALUES (?, ?, ?, ?, ?)',
+                           [(thread, f'{thread}-{i}', 'commandExecution', item, i)
+                            for thread in ('t1', 't2') for i in range(30)])
+            db.commit()
+            db.close()
+            found = status.CodexReader(Path(root)).command_history([{'id': 't1'}, {'id': 't2'}])
+        self.assertEqual(status.CODEX_COMMANDS, 20)
+        for thread in ('t1', 't2'):
+            ids = [c['item_id'] for c in found if c['thread_id'] == thread]
+            self.assertEqual(ids, [f'{thread}-{i}' for i in range(29, 9, -1)])
+
+
+    def test_codex_commands_without_times_take_the_thread_time(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as root:
+            db = sqlite3.connect(Path(root) / 'thread_history_1.sqlite')
+            # An older schema: no started_at_ms or completed_at_ms columns.
+            db.execute('CREATE TABLE thread_items (thread_id TEXT, item_id TEXT, item_type TEXT, '
+                       'item_json TEXT, rollout_ordinal INTEGER)')
+            db.execute('INSERT INTO thread_items VALUES (?, ?, ?, ?, ?)',
+                       ('t1', 'c1', 'commandExecution',
+                        json.dumps({'command': 'ls', 'status': 'completed', 'exitCode': 0}), 1))
+            db.commit()
+            db.close()
+            thread = dict(id='t1', cwd='/w', updated_at=now - 60)
+            with patch.object(status, 'codex_processes', return_value=[]):
+                found = status.CodexReader(Path(root)).tasks([thread], now, include_ended=True)
+        self.assertEqual([(r['id'], r['state'], r['updated']) for r in found], [('c1', 'finished', now - 60)])
+
+
 class Tty(io.StringIO):
     def isatty(self):
         return True
@@ -600,7 +670,9 @@ class TuiTests(unittest.TestCase):
                 self.assertIn('LEFT', texts[1])  # a command reports progress
                 self.assertIn('2/4', '\n'.join(texts))
                 self.assertIn('! docker down', '\n'.join(texts))
-                self.assertIn('4 shown, 1 hidden', texts[-1])
+                # The hidden count sits next to the key that shows it.
+                self.assertIn('l show 1 hidden', texts[-1])
+                self.assertTrue(texts[-1].rstrip().endswith('4 shown'), texts[-1])
                 # The key bar stays on the last line even when the list is short.
                 self.assertEqual((len(lines), lines[-1][0][0][1]), (40, 'bar'))
                 self.assertRegex(texts[1], r'^  STATE +NOW .*UPTIME +LAST +AI ')
@@ -615,6 +687,13 @@ class TuiTests(unittest.TestCase):
                 lines = status.tui_screen(self.rows(), ['docker down'], 2000, view(detail=True), width, 40)
                 self.assertTrue(all(status.cell_width(text(line)) <= width for line in lines))
                 self.assertEqual(len(lines), 40)
+        # The other hints give way before l and the hidden count do.
+        for show_all, toggle in ((False, 'l show 1 hidden'), (True, 'l hide 1 hidden')):
+            with self.subTest(show_all=show_all):
+                bar = text(status.tui_screen(self.rows(), [], 2000, view(show_all=show_all), 40, 24)[-1])
+                self.assertIn(toggle, bar)
+                self.assertIn('shown', bar)
+                self.assertNotIn('…', bar)
 
     def test_hidden_records_and_filters_follow_the_view(self):
         rows = self.rows()
@@ -629,10 +708,14 @@ class TuiTests(unittest.TestCase):
                          ['MCP', 'Tasks', 'Background Tasks', 'Sessions'])
         texts = [text(line) for line in lines]
         self.assertTrue(any(t[2:].startswith('✗ failed(2)') for t in texts))
+        # With hidden records on screen the bar still says how many of them there are.
+        self.assertIn('l hide 1 hidden', texts[-1])
+        self.assertTrue(texts[-1].rstrip().endswith('5 shown'), texts[-1])
         quiet = [r for r in rows if r['kind'] != 'task']
         self.assertNotIn('LEFT', text(status.tui_screen(quiet, [], 2000, view(), 120, 30)[1]))
         empty = [text(line) for line in status.tui_screen([], [], 2000, view(), 80, 10)]
         self.assertTrue(any('Nothing to show' in t for t in empty))
+        self.assertIn('l show 0 hidden', empty[-1])
 
     def test_keys_move_toggle_and_search(self):
         rows, v = self.rows(), view()
@@ -681,6 +764,29 @@ class TuiTests(unittest.TestCase):
         texts = [text(line) for line in status.tui_screen(rows, [], 2000, v, 100, 12)]
         self.assertEqual(len(texts), 12)
         self.assertTrue(any('job 25' in t and t.startswith('▶') for t in texts))
+
+    def test_page_keys_move_a_screen_and_home_end_go_to_the_ends(self):
+        rows = [status.row('claude', 'task', f'b{i}', 'p', 2000 - i, 'running', f'job {i}') for i in range(30)]
+        v = view()
+        selected = lambda: int(v['selected'][2][1:])
+        # 12 lines leave 9 for rows (title, header and key bar take 3); a page is one less.
+        status.tui_screen(rows, [], 2000, v, 100, 12)
+        self.assertEqual(v['page'], 9)
+        status.tui_handle(v, 'pgdn', rows)
+        self.assertEqual(selected(), 8)
+        status.tui_handle(v, 'pgdn', rows)
+        texts = [text(line) for line in status.tui_screen(rows, [], 2000, v, 100, 12)]
+        self.assertTrue(any('job 16' in t and t.startswith('▶') for t in texts))
+        status.tui_handle(v, 'pgup', rows)
+        self.assertEqual(selected(), 8)
+        status.tui_handle(v, 'end', rows)
+        self.assertEqual(selected(), 29)
+        status.tui_handle(v, 'pgdn', rows)  # stops at the last row
+        self.assertEqual(selected(), 29)
+        status.tui_handle(v, 'home', rows)
+        self.assertEqual(selected(), 0)
+        status.tui_handle(v, 'pgup', rows)
+        self.assertEqual(selected(), 0)
 
     def test_terminal_opens_the_live_view_and_plain_or_pipes_print_the_table(self):
         with patch.object(status, 'run_tui') as tui, patch.object(status.sys, 'stdin', Tty()), \
