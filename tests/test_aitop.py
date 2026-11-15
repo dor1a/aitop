@@ -264,6 +264,77 @@ class ClaudeAgentTests(unittest.TestCase):
             row = self.agent(directory, [dict(type='user', message=dict(content='go'))])
         self.assertIsNone(row['uptime'])
 
+    def notice(self, task, told, at=950):
+        return json.dumps(dict(type='queue-operation', operation='enqueue', sessionId='s1', timestamp=at, content=(
+            f'<task-notification>\n<task-id>{task}</task-id>\n<tool-use-id>t1</tool-use-id>\n'
+            f'<status>{told}</status>\n<summary>Agent "x" ended</summary>\n</task-notification>')))
+
+    def test_agent_stopped_by_its_session_reads_the_parent_notice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / 's1.jsonl'
+            agents = root / 's1/subagents'
+            agents.mkdir(parents=True)
+            path = agents / 'agent-a1.jsonl'
+            path.write_text(json.dumps(dict(type='user', timestamp=900, message=dict(content='go'))) + '\n')
+            os.utime(path, (1000, 1000))
+            read = lambda: status.ClaudeReader(root).agent(path, 'cwd', 5000, 's1')
+            parent.write_text(json.dumps(dict(type='user', message=dict(content='start'))) + '\n')
+            self.assertEqual(read()['state'], 'unknown')
+            # A line still being written does not count until its newline lands.
+            line = self.notice('a1', 'killed')
+            with parent.open('a') as stream:
+                stream.write(self.notice('a2', 'completed') + '\n' + line[:40])
+            self.assertEqual(read()['state'], 'unknown')
+            with parent.open('a') as stream:
+                stream.write(line[40:] + '\n')
+            row = read()
+            self.assertEqual((row['state'], row['evidence']), ('stopped', 'parent session task notification'))
+            self.assertEqual(row['last_line'], '')
+            self.assertEqual(status.task_notices(parent), {'a2': ('completed', 950), 'a1': ('killed', 950)})
+            # The record the stop leaves can land just after the notice; it is not a resume.
+            with path.open('a') as stream:
+                stream.write(json.dumps(dict(type='user', timestamp=950.003, message=dict(
+                    content=[dict(type='text', text='[Request interrupted by user]')]))) + '\n')
+            self.assertEqual(read()['state'], 'stopped')
+            # Resumed five seconds later: the message it was sent puts it back to work.
+            with path.open('a') as stream:
+                stream.write(json.dumps(dict(type='user', timestamp=955, message=dict(
+                    content='The coordinator sent a message: go on'))) + '\n')
+                stream.write(json.dumps(self.use('Bash', description='again')) + '\n')
+            os.utime(path, (4995, 4995))
+            row = read()
+            self.assertEqual((row['state'], row['last_line']), ('recent-output', 'again'))
+            # Stopped again: the newer notice wins.
+            with parent.open('a') as stream:
+                stream.write(self.notice('a1', 'killed', at=4996) + '\n')
+            self.assertEqual(read()['state'], 'stopped')
+
+    def test_an_explicit_notice_outranks_a_completed_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / 's1/subagents'
+            agents.mkdir(parents=True)
+            path = agents / 'agent-a1.jsonl'
+            path.write_text(json.dumps(dict(type='assistant', timestamp=900, message=dict(
+                stop_reason='end_turn', content=[dict(type='text', text='done')]))) + '\n')
+            os.utime(path, (1000, 1000))
+            read = lambda: status.ClaudeReader(root).agent(path, 'cwd', 5000, 's1')
+            self.assertEqual(read()['state'], 'turn-complete')
+            (root / 's1.jsonl').write_text(self.notice('a1', 'killed') + '\n')
+            self.assertEqual(read()['state'], 'stopped')
+
+    def test_parent_notices_skip_other_records_and_restart_on_a_new_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / 's1.jsonl'
+            quoted = dict(type='user', message=dict(content=self.notice('a1', 'killed')))
+            parent.write_text(json.dumps(quoted) + '\n' + self.notice('a1', 'completed') + '\n')
+            self.assertEqual(status.task_notices(parent), {'a1': ('completed', 950)})
+            parent.unlink()
+            parent.write_text(self.notice('a3', 'failed', at='2026-11-15T06:54:02.526Z') + '\n')
+            self.assertEqual(status.task_notices(parent), {'a3': ('failed', 1794725642.526)})
+            self.assertEqual(status.task_notices(Path(directory) / 'missing.jsonl'), {})
+
 
 class MouseTests(unittest.TestCase):
     def test_old_mouse_abi_takes_wheel_down_from_position_reports(self):

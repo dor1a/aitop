@@ -17,7 +17,7 @@ import sys
 import time
 import unicodedata
 
-__version__ = '0.1.2'
+__version__ = '0.1.3'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
 # Hidden records stop being listed a day after their last update; this is a view of
 # what runs now, and older history ran to hundreds of rows behind l.
@@ -413,6 +413,79 @@ def task_rows(project, now, session='*'):
     return result
 
 
+# When a background agent ends, Claude Code queues a <task-notification> into the
+# parent session, including when the session or the user stops it. The agent's own
+# files say nothing in that case, so a stopped agent would read as unknown.
+NOTICE_MARK = b'<task-notification>'
+NOTICE = re.compile(r'<task-id>([^<]+)</task-id>.*?<status>([^<]+)</status>', re.S)
+NOTICE_STATES = {'killed': 'stopped', 'stopped': 'stopped', 'completed': 'finished', 'failed': 'failed'}
+# Stopping an agent leaves this user record in its transcript, next to the notice.
+INTERRUPTED = '[Request interrupted'
+
+
+def resumed_after(records_, at):
+    """Whether the agent took a message or answered after a notice at `at`.
+
+    A stopped agent can be resumed with a message, which lands as a user record, and
+    the notice stays the last one until it stops again. The record left by the stop
+    itself does not count, whichever side of the notice its timestamp falls.
+    """
+    for record in records_:
+        if record.get('type') not in ('user', 'assistant') or timestamp(record.get('timestamp')) <= at:
+            continue
+        content = record.get('message', {}).get('content')
+        if isinstance(content, list):
+            content = ' '.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
+        if not (isinstance(content, str) and content.startswith(INTERRUPTED)):
+            return True
+    return False
+
+
+def task_notices(path):
+    """The last status a session transcript was notified of, and when, by task ID.
+
+    Transcripts only grow and can reach hundreds of megabytes, so a pass reads only
+    the complete lines appended since the previous pass.
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return {}
+    key = ('notices', str(path))
+    USED.add(key)
+    inode, offset, found = CACHE.get(key, (info.st_ino, 0, {}))
+    if inode != info.st_ino or info.st_size < offset:
+        offset, found = 0, {}
+    if info.st_size == offset:
+        return found
+    found = dict(found)
+    try:
+        with path.open('rb') as stream:
+            stream.seek(offset)
+            pending = b''
+            while True:
+                block = stream.read(4 * READ_CAP)
+                if not block:
+                    break
+                block = pending + block
+                cut = block.rfind(b'\n') + 1
+                done, pending = block[:cut], block[cut:]
+                offset += cut
+                if NOTICE_MARK not in done:
+                    continue
+                for line in done.split(b'\n'):
+                    if NOTICE_MARK not in line or b'"queue-operation"' not in line:
+                        continue
+                    record = object_json(line)
+                    if record.get('type') == 'queue-operation' and record.get('operation') == 'enqueue':
+                        for task, told in NOTICE.findall(str(record.get('content') or '')):
+                            found[task] = (told, timestamp(record.get('timestamp')))
+    except OSError:
+        return found
+    CACHE[key] = (info.st_ino, offset, found)
+    return found
+
+
 class ClaudeReader:
     def __init__(self, root):
         self.root = root / 'projects'
@@ -488,6 +561,14 @@ class ClaudeReader:
             state = 'finished'
         if meta.get('stoppedByUser'):
             state = 'stopped'
+        evidence = 'local transcript + metadata'
+        # Workflow agents report to their workflow, not to the session transcript. A
+        # completed turn is not the end of the agent, so an explicit notice still wins.
+        if state not in ('finished', 'stopped', 'failed') and path.parent.name == 'subagents':
+            told, at = task_notices(path.parents[1].with_suffix('.jsonl')).get(
+                path.stem.removeprefix('agent-'), (None, 0))
+            if told in NOTICE_STATES and not (at and resumed_after(last, at)):
+                state, evidence = NOTICE_STATES[told], 'parent session task notification'
         prompt = ''
         for item in first:
             if item.get('type') == 'user':
@@ -502,7 +583,7 @@ class ClaudeReader:
         return row('claude', 'agent', path.stem.removeprefix('agent-'), cwd, updated, state,
                    meta.get('description') or meta.get('agentType') or '(no description)',
                    parent=parent, model=assistant[-1].get('model', '') if assistant else '',
-                   task=prompt, evidence='local transcript + metadata',
+                   task=prompt, evidence=evidence,
                    uptime=None if started is None else max(0, int((updated if ended else now) - started)),
                    last_line='' if ended else agent_activity(last))
 
@@ -1509,6 +1590,8 @@ States:
   turn-complete  Last turn ended; not proof the whole task succeeded.
   finished       Subagent handed its result back, or a background command exited with code 0.
   failed         A background command exited non-zero, or a session's last turn ended on an API error.
+  stopped        A background command was killed, a Codex turn was interrupted, or a Claude agent
+                 was stopped by its session or the user.
   ok, warn       What a tool last reported on aibus.
   late           An aibus entry that runs on a timer missed two runs.
   gone           An aibus entry whose process ended without reporting an end.
