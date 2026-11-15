@@ -1335,6 +1335,24 @@ def tui_handle(view, key, rows):
     return None
 
 
+def mouse_buttons(lib):
+    """The mouse mask to ask for and the wheel up and down bits.
+
+    The wheel is buttons 4 and 5. ncurses built with the old mouse ABI, which is what
+    Python on macOS links, has no button 5 and reports wheel down as
+    REPORT_MOUSE_POSITION. ALL_MOUSE_EVENTS leaves that out, so without it every
+    turn down ends in a getmouse() error. It still asks the terminal for clicks only
+    (mode 1000), so no pointer motion arrives under that bit.
+    """
+    up = getattr(lib, 'BUTTON4_PRESSED', 0)
+    down = getattr(lib, 'BUTTON5_PRESSED', 0)
+    mask = lib.ALL_MOUSE_EVENTS
+    if not down:
+        down = lib.REPORT_MOUSE_POSITION
+        mask |= down
+    return mask, up, down
+
+
 def run_tui(view, project):
     import curses
     import locale
@@ -1391,11 +1409,9 @@ def run_tui(view, project):
         keys = {curses.KEY_UP: 'up', curses.KEY_DOWN: 'down', curses.KEY_ENTER: 'enter',
                 curses.KEY_BACKSPACE: 'backspace', curses.KEY_PPAGE: 'pgup', curses.KEY_NPAGE: 'pgdn',
                 curses.KEY_HOME: 'home', curses.KEY_END: 'end'}
-        # Wheel buttons are 4 (up) and 5 (down); ncurses builds older than 6 lack button 5.
-        wheel_up = getattr(curses, 'BUTTON4_PRESSED', 0)
-        wheel_down = getattr(curses, 'BUTTON5_PRESSED', 0)
+        mask, wheel_up, wheel_down = mouse_buttons(curses)
         clicks = curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
-        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mousemask(mask)
         screen.timeout(250)
         while True:
             _, rows, warnings = latest['data']
@@ -1425,7 +1441,7 @@ def run_tui(view, project):
                 target = lines[y][2] if 0 <= y < len(lines) else None
                 if state & wheel_up:
                     key = 'up'
-                elif wheel_down and state & wheel_down:
+                elif state & wheel_down:
                     key = 'down'
                 elif state & curses.BUTTON1_DOUBLE_CLICKED:
                     key = ('double', target)

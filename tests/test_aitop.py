@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -262,6 +263,18 @@ class ClaudeAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             row = self.agent(directory, [dict(type='user', message=dict(content='go'))])
         self.assertIsNone(row['uptime'])
+
+
+class MouseTests(unittest.TestCase):
+    def test_old_mouse_abi_takes_wheel_down_from_position_reports(self):
+        old = SimpleNamespace(BUTTON4_PRESSED=0x80000, ALL_MOUSE_EVENTS=0x7ffffff,
+                              REPORT_MOUSE_POSITION=0x8000000)
+        self.assertEqual(status.mouse_buttons(old), (0xfffffff, 0x80000, 0x8000000))
+
+    def test_new_mouse_abi_keeps_button_five(self):
+        new = SimpleNamespace(BUTTON4_PRESSED=0x10000, BUTTON5_PRESSED=0x200000,
+                              ALL_MOUSE_EVENTS=0xfffffff, REPORT_MOUSE_POSITION=0x10000000)
+        self.assertEqual(status.mouse_buttons(new), (0xfffffff, 0x10000, 0x200000))
 
 
 class ClaudeTaskTests(unittest.TestCase):
