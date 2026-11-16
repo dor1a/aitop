@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Read Claude/Codex local status without starting or resuming sessions."""
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime
+import fcntl
 import functools
 import json
 import math
@@ -14,10 +15,11 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 
-__version__ = '0.1.3'
+__version__ = '0.1.4'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
 # Hidden records stop being listed a day after their last update; this is a view of
 # what runs now, and older history ran to hundreds of rows behind l.
@@ -1132,6 +1134,10 @@ TUI_AI = ['both', 'claude', 'codex']
 # The theme's own grey (ANSI bright black). A fixed neutral grey such as 238 looked
 # gold next to a blue-black background like Tokyo Night's.
 SELECTED_BG = 8
+# Rows marked with Space, for an agent's prompt hook to read while the view runs.
+MARKS_FILE = Path(os.environ.get('AITOP_MARKS_FILE') or Path.home() / '.local/state/aitop/marked.json')
+# Marked rows take an aqua (256-color 50) that no state uses, as in todo; green on 16-color terminals.
+MARK_COLOR = 50
 
 
 def cell_width(text):
@@ -1200,15 +1206,119 @@ def tui_cells(r, now):
     }
 
 
-def tui_row(r, now, cols, selected):
+def tui_row(r, now, cols, selected, marked=False):
     icon, style = TUI_ICONS.get(r['state'], ('·', 'dim'))
     cells = tui_cells(r, now)
-    segments = [('▶ ' if selected else '  ', ''), (icon + ' ', style)]
+    # The selection arrow and the mark share the two cells before the state icon; the
+    # mark takes the first one unless the arrow does, so it does not touch the icon.
+    first = ('▶', '') if selected else ('*', 'mark') if marked else (' ', '')
+    second = ('*', 'mark') if selected and marked else (' ', '')
+    segments = [first, second, (icon + ' ', style)]
     for name, _, width, align in cols:
         text = fit(cells[name], width, align)
-        segments.append((text, style if name == 'state' else 'meta' if name in ('ai', 'left', 'uptime', 'idle') else ''))
+        # A marked row's text takes the mark color; the state keeps its own.
+        segments.append((text, style if name == 'state' else 'mark' if marked
+                         else 'meta' if name in ('ai', 'left', 'uptime', 'idle') else ''))
         segments.append(('  ', ''))
     return segments[:-1]
+
+
+def mark_fields(r):
+    """What a marked row hands the prompt hook: which record it is and what it runs.
+
+    NOW, LAST and UPTIME change every second, so they stay out; the file then changes
+    only when a mark or a marked row's state does.
+    """
+    code = r.get('exit_code')
+    fields = {'ai': r.get('bus_ai') or r['ai'], 'kind': f"{r['mode']}-task" if r.get('mode') else r['kind'],
+              'id': r['id'], 'state': r['state'] + (f'({code})' if code is not None else ''),
+              'title': r['title'], 'project': r.get('cwd'), 'parent': r.get('parent'),
+              'command': r.get('command'), 'evidence': r.get('evidence'), 'links': r.get('links')}
+    # Room for a real command; a reader that shows them cuts them to its own size.
+    return {name: clean(value, 2000) for name, value in fields.items() if value not in (None, '')}
+
+
+def marked_rows(rows, marked):
+    """The marked rows still listed, in a fixed order so a reshuffled list does not rewrite the file."""
+    return [mark_fields(r) for r in sorted(rows, key=lambda r: tuple(map(str, tui_key(r)))) if tui_key(r) in marked]
+
+
+def valid_pid(pid):
+    return isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2 ** 31
+
+
+def marks_owner(path=None):
+    """The pid that wrote the marks file, or None when there is no readable file or no sane pid."""
+    try:
+        pid = json.loads((path or MARKS_FILE).read_text(encoding='utf-8')).get('pid')
+    except (OSError, ValueError, AttributeError):
+        return None
+    return pid if valid_pid(pid) else None
+
+
+def pid_alive(pid):
+    if not valid_pid(pid):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OverflowError, OSError):
+        return False
+    return True
+
+
+@contextmanager
+def marks_lock(path):
+    """One writer at a time across aitop windows, so a check and the write or removal it guards stay together."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path.parent / '.marked.lock', os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def write_marks(rows, path=None):
+    """Publish the marked rows, or remove this view's file when there are none.
+
+    A failure here never stops the view; the marks only stay on screen then.
+    """
+    path = path or MARKS_FILE
+    try:
+        if not rows and not path.exists():
+            return
+        with marks_lock(path):
+            if not rows:
+                # Another window's file stays; an unreadable or ownerless one goes.
+                if marks_owner(path) in (os.getpid(), None):
+                    path.unlink()
+                return
+            fd, temp = tempfile.mkstemp(dir=path.parent, prefix='.marked-')
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                # written changes on every write, so marks dropped and set again read as new.
+                json.dump({'pid': os.getpid(), 'written': time.time(), 'rows': rows}, stream, ensure_ascii=False)
+            # mkstemp makes the file 600; the replace keeps a reader from seeing half a file.
+            os.replace(temp, path)
+    except OSError:
+        pass
+
+
+def clear_dead_marks(path=None):
+    """Remove a file left by a view that died without cleaning up."""
+    path = path or MARKS_FILE
+    try:
+        if not path.exists():
+            return
+        with marks_lock(path):
+            owner = marks_owner(path)
+            if owner != os.getpid() and not pid_alive(owner):
+                path.unlink()
+    except OSError:
+        pass
 
 
 def tui_detail(r, width):
@@ -1275,6 +1385,9 @@ def tui_screen(rows, warnings, now, view, width, height):
     keys = [tui_key(r) for r in shown]
     if view['selected'] not in keys:
         view['selected'] = keys[0] if keys else None
+    # A mark goes with its record once the record leaves the list; filters only hide it.
+    marked = view.setdefault('marked', set())
+    marked &= {tui_key(r) for r in rows}
     both = view['ai'] == 'both' and len({r['ai'] for r in shown}) > 1
     cols = tui_columns(width, both, any(r.get('left') is not None for r in shown))
     scope = {'both': 'claude+codex', 'claude': 'claude', 'codex': 'codex'}[view['ai']]
@@ -1299,7 +1412,7 @@ def tui_screen(rows, warnings, now, view, width, height):
         for r in group:
             lit = tui_key(r) == view['selected']
             mark = len(body) if lit else mark
-            body.append((tui_row(r, now, cols, lit), lit, tui_key(r)))
+            body.append((tui_row(r, now, cols, lit, tui_key(r) in marked), lit, tui_key(r)))
     if not body:
         body.append(([(fit('  Nothing to show. Press l to include hidden records.', width), 'meta')], False, None))
 
@@ -1313,15 +1426,15 @@ def tui_screen(rows, warnings, now, view, width, height):
     # The hidden count sits next to its key, so it stays readable once l shows them.
     hidden = len(tui_visible(rows, view, show_all=True)) - len(tui_visible(rows, view, show_all=False))
     toggle = f"l {'hide' if view['show_all'] else 'show'} {hidden} hidden"
-    count = f'{len(shown)} shown '
+    count = (f'{len(marked)} marked  ' if marked else '') + f'{len(shown)} shown '
     if view['typing'] is not None:
         hint = f' /{view["typing"]}▏  Enter apply  Esc cancel'
     else:
-        hints = (['↑↓ move', '⏎ details', toggle, 'a AI', '/ search']
-                 + (['Esc clear search'] if view['query'] else []) + ['q quit'])
+        hints = (['↑↓ move', '⏎ details', 'space mark', toggle, 'a AI', '/ search']
+                 + (['Esc clear search'] if view['query'] else ['Esc clear marks'] if marked else []) + ['q quit'])
         # On a narrow pane the hints give way, least needed first, so l and its count stay.
-        for old, new in [('/ search', None), ('a AI', None),
-                         ('⏎ details', None), ('Esc clear search', None), ('↑↓ move', None), ('q quit', None)]:
+        for old, new in [('/ search', None), ('a AI', None), ('space mark', None), ('⏎ details', None),
+                         ('Esc clear search', None), ('Esc clear marks', None), ('↑↓ move', None), ('q quit', None)]:
             if cell_width(' ' + '  '.join(hints)) <= width - cell_width(count):
                 break
             if old in hints:
@@ -1369,8 +1482,8 @@ def clip(segments, width):
 def tui_handle(view, key, rows):
     """Apply one key and return 'quit' to leave.
 
-    A key is a character, 'up', 'down', 'pgup', 'pgdn', 'home', 'end', 'enter',
-    'esc', 'backspace', or a mouse
+    A key is a character (' ' marks or unmarks the selected row), 'up', 'down', 'pgup',
+    'pgdn', 'home', 'end', 'enter', 'esc', 'backspace', or a mouse
     event: ('click', row key) or ('double', row key), with None off the rows.
     """
     if isinstance(key, tuple):
@@ -1405,6 +1518,9 @@ def tui_handle(view, key, rows):
             view['selected'] = keys[max(0, min(len(keys) - 1, i))]
     elif key == 'enter':
         view['detail'] = not view['detail']
+    elif key == ' ':
+        if view['selected'] is not None:
+            view.setdefault('marked', set()).symmetric_difference_update({view['selected']})
     elif key == 'l':
         view['show_all'] = not view['show_all']
     elif key == 'a':
@@ -1412,7 +1528,11 @@ def tui_handle(view, key, rows):
     elif key == '/':
         view['typing'] = view['query']
     elif key == 'esc':
-        view['query'] = ''
+        # One Esc clears the search; with no search it clears the marks.
+        if view['query']:
+            view['query'] = ''
+        else:
+            view.setdefault('marked', set()).clear()
     return None
 
 
@@ -1443,6 +1563,9 @@ def run_tui(view, project):
     os.environ.setdefault('ESCDELAY', '25')
     latest = {'data': (time.time(), [], []), 'error': None}
     stop = threading.Event()
+    # The marks last written, so the file changes only when they do.
+    written = [None]
+    clear_dead_marks()
 
     def reader():
         # Reading takes a fraction of a second, so it runs beside the keys.
@@ -1459,7 +1582,7 @@ def run_tui(view, project):
         curses.curs_set(0)
         styles = {'title': curses.A_REVERSE | curses.A_BOLD, 'bar': curses.A_REVERSE,
                   'group': curses.A_BOLD, 'dim': curses.A_NORMAL, 'head': curses.A_BOLD,
-                  'meta': curses.A_NORMAL}
+                  'meta': curses.A_NORMAL, 'mark': curses.A_BOLD}
         selected = curses.A_REVERSE
         lit_styles = {}
         if curses.has_colors():
@@ -1487,6 +1610,12 @@ def run_tui(view, project):
                 for i, (name, color) in enumerate(lit.items(), len(colors) + 4):
                     curses.init_pair(i, color, SELECTED_BG)
                     lit_styles[name] = curses.color_pair(i) | curses.A_BOLD
+                mark = MARK_COLOR if curses.COLORS >= 256 else curses.COLOR_GREEN
+                pair = len(colors) + 4 + len(lit)
+                curses.init_pair(pair, mark, -1)
+                curses.init_pair(pair + 1, mark, SELECTED_BG)
+                styles['mark'] = curses.color_pair(pair) | curses.A_BOLD
+                lit_styles['mark'] = curses.color_pair(pair + 1) | curses.A_BOLD
         keys = {curses.KEY_UP: 'up', curses.KEY_DOWN: 'down', curses.KEY_ENTER: 'enter',
                 curses.KEY_BACKSPACE: 'backspace', curses.KEY_PPAGE: 'pgup', curses.KEY_NPAGE: 'pgdn',
                 curses.KEY_HOME: 'home', curses.KEY_END: 'end'}
@@ -1501,6 +1630,11 @@ def run_tui(view, project):
             screen.erase()
             # The last column is left empty: writing there fails on the bottom line.
             lines = tui_screen(rows, warnings, time.time(), view, width - 1, height)[:height]
+            # Rewritten only when the marks or a marked row's state change.
+            marks = marked_rows(rows, view.get('marked', set()))
+            if marks != written[0]:
+                write_marks(marks)
+                written[0] = marks
             for y, (segments, lit, _) in enumerate(lines):
                 x = 0
                 for text, style in segments:
@@ -1542,6 +1676,8 @@ def run_tui(view, project):
         pass
     finally:
         stop.set()
+        # Marks live only while the view runs.
+        write_marks([])
 
 
 def main(argv=None):
@@ -1549,10 +1685,14 @@ def main(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""In a terminal, aitop opens a live view of everything -a shows, refreshed
 every second. Keys: up/down or j/k move, Page Up and Page Down move a screen,
-Home and End go to the first and last row, Enter opens details, l shows hidden
-records, a switches between both AIs, Claude and Codex, / searches titles, Esc
-clears the search, q quits. With the mouse, a click selects a row, a double click
-opens its details and the wheel moves. --ai, --kind and -l set what it shows first.
+Home and End go to the first and last row, Enter opens details, Space marks or
+unmarks a row (several can be marked), l shows hidden records, a switches between
+both AIs, Claude and Codex, / searches titles, Esc clears the search and then the
+marks, q quits. With the mouse, a click selects a row, a double click opens its
+details and the wheel moves. --ai, --kind and -l set what it shows first.
+Marked rows are written to ~/.local/state/aitop/marked.json (AITOP_MARKS_FILE
+overrides it) while the view runs, and the file goes when the marks are cleared or
+the view quits, so an agent's prompt hook can read which rows a message is about.
 In the live view, NOW is the last line a Claude shell command printed, so for a
 running command it is the step it is on. For a Claude agent it is its latest tool
 call. LEFT appears only while some command

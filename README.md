@@ -72,10 +72,13 @@ In a terminal, `aitop` opens the live view. Rows are grouped, each with a colore
 | Home, End | Go to the first or last row |
 | Click | Select a row |
 | Enter or double click | Open or close details |
+| Space | Mark or unmark the selected row. Several rows can be marked |
 | `l` | Show or hide hidden records from the last 24 hours. The key bar says how many there are |
 | `a` | Switch between both AIs, Claude and Codex |
-| `/` | Search titles and IDs. Esc while typing cancels the edit; Esc afterwards clears the search |
+| `/` | Search titles and IDs. Esc while typing cancels the edit; Esc afterwards clears the search, and Esc with no search clears the marks |
 | `q` | Quit |
+
+While the view runs, the marked rows are written to `~/.local/state/aitop/marked.json` (`AITOP_MARKS_FILE` overrides it): the record's AI, kind, ID, state, title, project and command, without the output that changes every second. The file goes when the marks are cleared or the view quits. A prompt hook can read it and tell the agent which rows the next message is about.
 
 While the view runs it takes the mouse, so selecting text needs the terminal's override: hold Option while dragging in iTerm2, or turn off View > Allow Mouse Reporting in Terminal.app.
 

@@ -711,6 +711,37 @@ def text(line):
     return ''.join(t for t, _ in line[0])
 
 
+class MarksFileTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / 'state' / 'marked.json'
+
+    def test_written_private_and_removed_only_by_its_owner(self):
+        status.write_marks([{'id': 'b1'}], self.path)
+        data = json.loads(self.path.read_text(encoding='utf-8'))
+        self.assertEqual((data['pid'], data['rows']), (os.getpid(), [{'id': 'b1'}]))
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+        # Another live window's file stays when this one has no marks.
+        other = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        self.path.write_text(json.dumps({'pid': other.pid, 'written': 1, 'rows': [{'id': 'x'}]}))
+        status.write_marks([], self.path)
+        self.assertTrue(self.path.exists())
+        status.clear_dead_marks(self.path)
+        self.assertTrue(self.path.exists())
+        # A file from a dead or impossible pid goes at start.
+        for pid in (2 ** 40, 0, 'x'):
+            self.path.write_text(json.dumps({'pid': pid, 'rows': [{'id': 'x'}]}))
+            status.clear_dead_marks(self.path)
+            self.assertFalse(self.path.exists(), pid)
+        status.write_marks([{'id': 'b1'}], self.path)
+        status.write_marks([], self.path)
+        self.assertFalse(self.path.exists())
+
+
 class TuiTests(unittest.TestCase):
     def rows(self):
         return [
@@ -821,6 +852,68 @@ class TuiTests(unittest.TestCase):
         status.tui_handle(v, 'esc', rows)
         self.assertEqual(v['query'], '')
         self.assertEqual(status.tui_handle(v, 'q', rows), 'quit')
+
+    def test_space_marks_rows_and_esc_clears_the_search_then_the_marks(self):
+        rows, v = self.rows(), view()
+        status.tui_screen(rows, [], 2000, v, 120, 30)
+        status.tui_handle(v, ' ', rows)
+        status.tui_handle(v, 'down', rows)
+        status.tui_handle(v, ' ', rows)
+        self.assertEqual(v['marked'], {('claude', 'mcp', 'm1'), ('claude', 'task', 'b1')})
+        status.tui_handle(v, ' ', rows)
+        self.assertEqual(v['marked'], {('claude', 'mcp', 'm1')})
+        lines = status.tui_screen(rows, [], 2000, v, 120, 30)
+        texts = [text(line) for line in lines]
+        mcp = next(line for line in lines if line[2] == ('claude', 'mcp', 'm1'))
+        self.assertTrue(text(mcp).startswith('* ● '), text(mcp))
+        # No background: the mark and the row's text take the mark color, the state keeps its own.
+        self.assertEqual((mcp[1], mcp[0][0], mcp[0][-1][1]), (False, ('*', 'mark'), 'mark'))
+        self.assertEqual(mcp[0][3][1], 'ok')
+        self.assertTrue(text(next(line for line in lines if line[2] == ('claude', 'task', 'b1'))).startswith('▶ ● '))
+        status.tui_handle(v, 'up', rows)
+        lines = status.tui_screen(rows, [], 2000, v, 120, 30)
+        both = next(line for line in lines if line[2] == ('claude', 'mcp', 'm1'))
+        # The cursor on a marked row: the cursor's background, and the mark beside the arrow.
+        self.assertEqual((text(both)[:4], both[1]), ('▶*● ', True))
+        texts = [text(line) for line in lines]
+        self.assertIn('space mark', texts[-1])
+        self.assertIn('Esc clear marks', texts[-1])
+        self.assertTrue(texts[-1].rstrip().endswith('1 marked  4 shown'), texts[-1])
+        # Space while typing goes into the search, and the first Esc clears the search only.
+        status.tui_handle(v, '/', rows)
+        for key in ['a', ' ', 'b', 'enter']:
+            status.tui_handle(v, key, rows)
+        self.assertEqual((v['query'], len(v['marked'])), ('a b', 1))
+        status.tui_handle(v, 'esc', rows)
+        self.assertEqual((v['query'], len(v['marked'])), ('', 1))
+        status.tui_handle(v, 'esc', rows)
+        self.assertEqual(v['marked'], set())
+
+    def test_a_mark_stays_through_filters_and_goes_with_its_record(self):
+        rows, v = self.rows(), view()
+        status.tui_screen(rows, [], 2000, v, 120, 30)
+        status.tui_handle(v, ' ', rows)
+        status.tui_screen(rows, [], 2000, dict(v, ai='codex'), 120, 30)
+        self.assertEqual(v['marked'], {('claude', 'mcp', 'm1')})
+        status.tui_screen([r for r in rows if r['id'] != 'm1'], [], 2000, v, 120, 30)
+        self.assertEqual(v['marked'], set())
+
+    def test_marked_rows_leave_out_what_changes_every_second(self):
+        rows = self.rows()
+        marked = {('claude', 'task', 'b1'), ('claude', 'task', 'b2')}
+        out = status.marked_rows(rows, marked)
+        self.assertEqual([r['id'] for r in out], ['b1', 'b2'])
+        self.assertEqual(out[0]['kind'], 'bg-task')
+        self.assertEqual(out[1]['state'], 'failed(2)')
+        self.assertEqual(out[0]['parent'], 's1')
+        for r in out:
+            self.assertFalse({'now', 'last_line', 'uptime', 'idle', 'progress'} & set(r), r)
+        # A long command is kept whole enough for a reader to cut it itself.
+        long = [dict(rows[0], command='echo ' + 'x' * 600)]
+        self.assertEqual(len(status.marked_rows(long, marked)[0]['command']), 605)
+        # The same rows in another order and with new output write the same marks.
+        moved = [dict(r, last_line='[3/4] next', updated=r['updated'] + 5) for r in reversed(rows)]
+        self.assertEqual(status.marked_rows(moved, marked), out)
 
     def test_mouse_clicks_select_and_double_clicks_toggle_details(self):
         rows, v = self.rows(), view()
