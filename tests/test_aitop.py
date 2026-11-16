@@ -598,6 +598,193 @@ class ClaudeTaskTests(unittest.TestCase):
             self.assertIn('fg-task', output.getvalue())
             self.assertIn('bg-task', output.getvalue())
 
+    def test_monitor_tasks_run_until_their_end_marker_or_deadline(self):
+        def use(call, name, description, when, **given):
+            return dict(type='assistant', timestamp=when, message=dict(content=[dict(
+                type='tool_use', id=call, name=name, input=dict(description=description, **given))]))
+
+        def answer(call, when, field=None, text='...'):
+            entry = dict(type='user', timestamp=when, message=dict(content=[dict(
+                type='tool_result', tool_use_id=call, content=text)]))
+            if field is not None:
+                entry['toolUseResult'] = field
+            return entry
+
+        now = 2000000000
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'projects/-work-project'
+            tasks = root / 'tmp/-work-project/session-1/tasks'
+            project.mkdir(parents=True)
+            tasks.mkdir(parents=True)
+            (tasks / 'live.output').write_text('first event\n')
+            (tasks / 'done.output').write_text('event\n\n[exited with code 0]\n')
+            (tasks / 'expired.output').write_text('event\n')
+            (tasks / 'texted.output').write_text('')
+            (tasks / 'fgjob.output').write_text('step 1\n')
+            entries = [
+                use('m1', 'Monitor', '웹훅 감시', now - 60, command='watch.py', timeout_ms=1800000),
+                answer('m1', now - 59, dict(taskId='live', timeoutMs=1800000, persistent=False)),
+                use('m2', 'Monitor', '끝난 감시', now - 600, command='watch.py'),
+                answer('m2', now - 599, dict(taskId='done', timeoutMs=300000, persistent=False)),
+                use('m3', 'Monitor', '시간 지난 감시', now - 3600, command='watch.py'),
+                answer('m3', now - 3599, dict(taskId='expired', timeoutMs=300000, persistent=False)),
+                # An older record keeps only the message text; the deadline then comes from the input.
+                use('m4', 'Monitor', '문구만 있는 감시', now - 30, command='tail.sh', timeout_ms=9999999),
+                answer('m4', now - 29, text='Monitor started (task texted, expires in 30m ...)'),
+                use('t1', 'Bash', '지금 도는 명령', now - 20),
+                # A monitor call still waiting for its result must not take the shell command's title.
+                use('m5', 'Monitor', '응답 없는 감시', now - 10, command='x')]
+            (project / 'session-1.jsonl').write_text('\n'.join(json.dumps(e, ensure_ascii=False) for e in entries))
+            held = {str((tasks / 'fgjob.output').resolve())}
+            with patch.object(status, 'TASK_ROOT', root / 'tmp'), \
+                 patch.object(status, 'held_open', return_value=held):
+                rows = {r['id']: r for r in status.task_rows(project, now)}
+            self.assertEqual({k: (r['mode'], r['state'], r['title']) for k, r in rows.items()},
+                             {'live': ('bg', 'running', '웹훅 감시'),
+                              'done': ('bg', 'finished', '끝난 감시'),
+                              'expired': ('bg', 'stopped', '시간 지난 감시'),
+                              'texted': ('bg', 'running', '문구만 있는 감시'),
+                              'fgjob': ('fg', 'running', '지금 도는 명령')})
+            self.assertEqual(rows['live']['uptime'], 60)
+            self.assertEqual(rows['live']['command'], 'watch.py')
+            self.assertIn('monitor deadline', rows['live']['evidence'])
+            # The cap on the input deadline: 30 minutes, not the 9999999 ms asked for.
+            with patch.object(status, 'TASK_ROOT', root / 'tmp'), \
+                 patch.object(status, 'held_open', return_value=held):
+                later = {r['id']: r for r in status.task_rows(project, now - 30 + 1801)}
+            self.assertEqual(later['texted']['state'], 'stopped')
+
+    def test_a_monitor_file_born_after_the_tail_start_finds_its_older_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'projects/-work-project'
+            tasks = root / 'tmp/-work-project/session-1/tasks'
+            project.mkdir(parents=True)
+            tasks.mkdir(parents=True)
+            filler = [dict(type='user', timestamp=t, message=dict(content='x' * 200))
+                      for t in range(1000, 1100)]
+            call = [dict(type='assistant', timestamp=1050, message=dict(content=[dict(
+                        type='tool_use', id='m1', name='Monitor',
+                        input=dict(description='늦게 생긴 감시', command='watch.py'))])),
+                    dict(type='user', timestamp=1050,
+                         toolUseResult=dict(taskId='mon', timeoutMs=300000, persistent=False),
+                         message=dict(content=[dict(type='tool_result', tool_use_id='m1', content='...')]))]
+            (project / 'session-1.jsonl').write_text(
+                '\n'.join(map(json.dumps, filler[:50] + call + filler[50:])))
+            # The monitor's first event made its file after the tail read starts.
+            (tasks / 'mon.output').write_text('first event\n')
+            # An unmarked file with no call anywhere stays out.
+            (tasks / 'stray.output').write_text('')
+            with patch.object(status, 'TASK_ROOT', root / 'tmp'), \
+                 patch.object(status, 'READ_CAP', 600), patch.object(status, 'LOOKUP_SPAN', 2), \
+                 patch.object(status, 'MONITOR_TIMEOUT_CAP', 60000), \
+                 patch.object(status, 'birthtime', return_value=1098), \
+                 patch.object(status, 'held_open', return_value=set()):
+                self.assertEqual(status.task_details(project / 'session-1.jsonl')[0], {})
+                rows = {r['id']: r for r in status.task_rows(project, 1100)}
+            self.assertEqual((rows['mon']['state'], rows['mon']['title']), ('running', '늦게 생긴 감시'))
+            # Whether a stray file shows at all depends on the platform's birth time;
+            # either way it never takes the monitor's place.
+            if 'stray' in rows:
+                self.assertEqual((rows['stray']['state'], rows['stray']['title']), ('stopped', '(no description)'))
+
+    def test_monitor_calls_far_before_their_file_are_found_ended_or_not(self):
+        # A monitor that ended after a late first event, and a live one whose file
+        # came long after the call and before the tail read starts.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'projects/-work-project'
+            tasks = root / 'tmp/-work-project/session-1/tasks'
+            project.mkdir(parents=True)
+            tasks.mkdir(parents=True)
+
+            def call(task, call_id, description, when):
+                return [dict(type='assistant', timestamp=when, message=dict(content=[dict(
+                            type='tool_use', id=call_id, name='Monitor',
+                            input=dict(description=description, command='watch.py'))])),
+                        dict(type='user', timestamp=when,
+                             toolUseResult=dict(taskId=task, timeoutMs=1800000, persistent=False),
+                             message=dict(content=[dict(type='tool_result', tool_use_id=call_id, content='...')]))]
+
+            filler = [dict(type='user', timestamp=t, message=dict(content='x' * 200))
+                      for t in range(1000, 3000, 10)]
+            # Calls at 1100 and 2000; files at 1950 (850 s later) and 2995 (995 s later).
+            entries = filler[:10] + call('old', 'm2', '오래 기다린 감시', 1100) + filler[10:100] \
+                + call('ended', 'm1', '끝난 감시', 2000) + filler[100:]
+            (project / 'session-1.jsonl').write_text('\n'.join(map(json.dumps, entries)))
+            (tasks / 'ended.output').write_text('event\n\n[exited with code 0]\n')
+            (tasks / 'old.output').write_text('event\n')
+            born = {'ended': 2995, 'old': 1950}
+            # At this READ_CAP the 30 minutes before each file hold far more than 8 * READ_CAP.
+            with patch.object(status, 'TASK_ROOT', root / 'tmp'), \
+                 patch.object(status, 'READ_CAP', 600), patch.object(status, 'LOOKUP_SPAN', 2), \
+                 patch.object(status, 'birthtime', side_effect=lambda path: born.get(path.stem)), \
+                 patch.object(status, 'held_open', return_value=set()):
+                since = status.task_details(project / 'session-1.jsonl')[1]
+                self.assertTrue(born['old'] < since <= born['ended'])
+                rows = {r['id']: r for r in status.task_rows(project, 2000)}
+            self.assertEqual({k: (r['mode'], r['state'], r['title']) for k, r in rows.items()},
+                             {'ended': ('bg', 'finished', '끝난 감시'),
+                              'old': ('bg', 'running', '오래 기다린 감시')})
+
+    def test_a_monitor_shows_before_its_first_event_makes_a_file(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'projects/-work-project'
+            (root / 'tmp/-work-project/session-1/tasks').mkdir(parents=True)
+            project.mkdir(parents=True)
+
+            def monitor(task, call_id, description, when, timeout=1800000, persistent=False):
+                return [dict(type='assistant', timestamp=when, message=dict(content=[dict(
+                            type='tool_use', id=call_id, name='Monitor',
+                            input=dict(description=description, command='watch.py'))])),
+                        dict(type='user', timestamp=when,
+                             toolUseResult=dict(taskId=task, timeoutMs=timeout, persistent=persistent),
+                             message=dict(content=[dict(type='tool_result', tool_use_id=call_id, content='...')]))]
+
+            entries = (monitor('waiting', 'm1', '첫 이벤트 기다리는 감시', now - 120)
+                       + monitor('expired', 'm2', '시간 지난 감시', now - 900, timeout=300000)
+                       + monitor('forever', 'm3', '세션 끝까지 감시', now - 60, persistent=True))
+            (project / 'session-1.jsonl').write_text('\n'.join(map(json.dumps, entries)))
+            # A transcript untouched for longer than the cap is not read for monitors.
+            stale = project / 'session-2.jsonl'
+            stale.write_text('\n'.join(map(json.dumps, monitor('stale', 'm4', '옛 감시', now - 60))))
+            os.utime(stale, (now - 3600, now - 3600))
+            with patch.object(status, 'TASK_ROOT', root / 'tmp'), \
+                 patch.object(status, 'held_open', return_value=set()):
+                rows = {r['id']: r for r in status.task_rows(project, now)}
+            self.assertEqual({k: (r['mode'], r['state'], r['title']) for k, r in rows.items()},
+                             {'waiting': ('bg', 'running', '첫 이벤트 기다리는 감시')})
+            self.assertEqual(rows['waiting']['uptime'], 120)
+            self.assertEqual(rows['waiting']['parent'], 'session-1')
+
+    def test_a_waiting_monitor_pushed_out_of_the_tail_still_shows(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'projects/-work-project'
+            (root / 'tmp/-work-project/session-1/tasks').mkdir(parents=True)
+            project.mkdir(parents=True)
+            call = [dict(type='assistant', timestamp=now - 600, message=dict(content=[dict(
+                        type='tool_use', id='m1', name='Monitor',
+                        input=dict(description='오래 기다리는 감시', command='watch.py'))])),
+                    dict(type='user', timestamp=now - 600,
+                         toolUseResult=dict(taskId='waiting', timeoutMs=1800000, persistent=False),
+                         message=dict(content=[dict(type='tool_result', tool_use_id='m1', content='...')]))]
+            # The conversation after the call fills more than the tail read.
+            filler = [dict(type='user', timestamp=now - 590 + i, message=dict(content='x' * 200))
+                      for i in range(100)]
+            (project / 'session-1.jsonl').write_text('\n'.join(map(json.dumps, call + filler)))
+            with patch.object(status, 'TASK_ROOT', root / 'tmp'), \
+                 patch.object(status, 'READ_CAP', 600), \
+                 patch.object(status, 'held_open', return_value=set()):
+                self.assertNotIn('waiting', status.task_details(project / 'session-1.jsonl')[0])
+                rows = {r['id']: r for r in status.task_rows(project, now)}
+            self.assertEqual({k: (r['state'], r['title']) for k, r in rows.items()},
+                             {'waiting': ('running', '오래 기다리는 감시')})
+
     def test_all_flag_reads_every_project(self):
         seen = []
 

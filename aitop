@@ -19,7 +19,7 @@ import tempfile
 import time
 import unicodedata
 
-__version__ = '0.1.5'
+__version__ = '0.1.6'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
 # Hidden records stop being listed a day after their last update; this is a view of
 # what runs now, and older history ran to hundreds of rows behind l.
@@ -139,6 +139,13 @@ TASK_END = re.compile(rb'\[(?:exited with code (-?\d+)|(killed))\]\s*$')
 # "Command running in background with ID: x", or "... moved to the background
 # (ID: x)" when a foreground command hits its timeout.
 TASK_ID = re.compile(r'background (?:with |\()ID: (\w+)')
+# A Monitor call answers "Monitor started (task x, expires in 30m ...)". Claude Code
+# writes the monitor's events to the same tasks/<id>.output, but no process holds
+# that file open, so a monitor counts as running until its end marker or deadline.
+MONITOR_ID = re.compile(r'Monitor started \(task (\w+)')
+# Monitor deadlines default to 5 minutes and are capped at 30.
+MONITOR_TIMEOUT = 300000
+MONITOR_TIMEOUT_CAP = 1800000
 # A task reports its ID when it starts, or at the timeout (10 minutes at most).
 LOOKUP_SPAN = 660
 # A command reports progress as "[n/m]" at the start of a line or "n%" at its end.
@@ -269,12 +276,22 @@ def scan_tasks(rows, titles, pending=None):
             given = block.get('input')
             given = given if isinstance(given, dict) else {}
             # Not only run_in_background: a foreground command can be sent to the background later.
-            if kind == 'assistant' and block.get('type') == 'tool_use' and block.get('name') == 'Bash':
-                started[block.get('id')] = dict(title=given.get('description') or '(no description)',
-                                                command=given.get('command'),
-                                                started=timestamp(record.get('timestamp')))
+            if kind == 'assistant' and block.get('type') == 'tool_use' and block.get('name') in ('Bash', 'Monitor'):
+                detail = dict(title=given.get('description') or '(no description)',
+                              command=given.get('command'),
+                              started=timestamp(record.get('timestamp')))
+                if block.get('name') == 'Monitor':
+                    ws = given.get('ws')
+                    detail.update(monitor=True, timeout_ms=given.get('timeout_ms'),
+                                  command=detail['command'] or (ws.get('url') if isinstance(ws, dict) else None))
+                started[block.get('id')] = detail
             elif kind == 'user' and block.get('type') == 'tool_result' and block.get('tool_use_id') in started:
                 detail = started.pop(block['tool_use_id'])
+                if detail.get('monitor'):
+                    task = monitor_task(detail, result, block.get('content'))
+                    if task:
+                        titles.setdefault(task, detail)
+                    continue
                 # Newer versions keep the ID in a field. Command output can quote the
                 # message text, so read the text only when the field record is absent.
                 if isinstance(result, dict):
@@ -285,7 +302,25 @@ def scan_tasks(rows, titles, pending=None):
                 if task:
                     titles.setdefault(task, dict(detail, timeout=True) if timeout else detail)
     if pending is not None:
-        pending.extend(started.values())
+        # Only a foreground shell command holds its output file while it waits.
+        pending.extend(d for d in started.values() if not d.get('monitor'))
+
+
+def monitor_task(detail, result, content):
+    """Return a Monitor call's task ID and store its deadline in detail."""
+    if isinstance(result, dict):
+        task, limit, persistent = result.get('taskId'), result.get('timeoutMs'), result.get('persistent')
+    else:
+        found = MONITOR_ID.search(json.dumps(content, ensure_ascii=False))
+        task, limit, persistent = found and found.group(1), None, False
+    if not isinstance(limit, (int, float)) or limit <= 0:
+        limit = detail.get('timeout_ms')
+        limit = limit if isinstance(limit, (int, float)) and limit > 0 else MONITOR_TIMEOUT
+        limit = min(limit, MONITOR_TIMEOUT_CAP)
+    start = detail.get('started')
+    detail['persistent'] = bool(persistent)
+    detail['deadline'] = start + limit / 1000 if start and not persistent else None
+    return task
 
 
 def first_stamp(stream, offset):
@@ -312,25 +347,30 @@ def stamp_offset(stream, size, when):
     return low
 
 
-def older_tasks(transcript, births):
+def older_tasks(transcript, births, back=None):
     """Find tasks the tail read missed by reading only around when each output file was made.
 
     Transcripts only grow, so a bisect on record timestamps finds that spot
     without reading the whole file. Those spots lie before the tail read and no
     longer change, so the answer is kept while the same tasks are asked about.
+    `back` is how long before the file the call may lie (LOOKUP_SPAN by default).
     """
-    key = ('older', str(transcript), frozenset(births.items()))
+    back = LOOKUP_SPAN if back is None else back
+    key = ('older', str(transcript), frozenset(births.items()), back)
     USED.add(key)
     if key in CACHE:
         return CACHE[key]
+    # A look back wider than a shell task's is for monitors: read the whole span,
+    # but parse only the lines that name a monitor call or its answer.
+    monitors = back > LOOKUP_SPAN
     titles, spans = {}, []
     try:
         with transcript.open('rb') as stream:
             size = stream.seek(0, 2)
             for born in births.values():
-                start = stamp_offset(stream, size, born - LOOKUP_SPAN)
+                start = stamp_offset(stream, size, born - back)
                 end = stamp_offset(stream, size, born + LOOKUP_SPAN) + READ_CAP
-                spans.append([start, min(size, end, start + 8 * READ_CAP)])
+                spans.append([start, min(size, end) if monitors else min(size, end, start + 8 * READ_CAP)])
             merged = []
             for span in sorted(spans):
                 if merged and span[0] <= merged[-1][1]:
@@ -338,6 +378,9 @@ def older_tasks(transcript, births):
                 else:
                     merged.append(span)
             for start, end in merged:
+                if monitors:
+                    scan_tasks(monitor_records(stream, start, end), titles)
+                    continue
                 stream.seek(start)
                 if start:
                     stream.readline()
@@ -346,6 +389,48 @@ def older_tasks(transcript, births):
         return {}
     CACHE[key] = {task: value for task, value in titles.items() if task in births}
     return CACHE[key]
+
+
+def monitor_records(stream, start, end):
+    """Records between two offsets that can hold a monitor call or its answer.
+
+    The call names Monitor; the answer carries a taskId field, or names Monitor
+    in its text when an older record lacks the field.
+    """
+    rows = []
+    stream.seek(start)
+    if start:
+        stream.readline()
+    while stream.tell() < end and (line := stream.readline()):
+        if (b'Monitor' in line or b'"taskId"' in line) and (row := object_json(line)):
+            rows.append(row)
+    return rows
+
+
+# Monitor lookups before the tail are kept for this long, so a live view does
+# not read the same stretch on every refresh.
+MONITOR_WINDOW_STEP = 300
+
+
+def monitor_window(transcript, start, end):
+    """Monitor calls recorded between two times, from the lines that name Monitor."""
+    step = MONITOR_WINDOW_STEP
+    start, end = start // step * step, -(-end // step) * step
+    key = ('monitors', str(transcript), start, end)
+    USED.add(key)
+    if key in CACHE:
+        return CACHE[key]
+    titles = {}
+    try:
+        with transcript.open('rb') as stream:
+            size = stream.seek(0, 2)
+            begin = stamp_offset(stream, size, start)
+            scan_tasks(monitor_records(stream, begin, min(size, stamp_offset(stream, size, end) + READ_CAP)),
+                       titles)
+    except OSError:
+        return {}
+    CACHE[key] = titles
+    return titles
 
 
 def birthtime(path):
@@ -373,11 +458,21 @@ def task_rows(project, now, session='*'):
             transcript = project / (owner + '.jsonl')
             found, since, pending = titles[owner] = task_details(transcript)
             # Without a birth time (Linux) there is no spot to look, so those keep no title.
-            births = {other.stem: born for other in ends
-                      if other.parents[1].name == owner and other.stem not in found
-                      and (born := birthtime(other)) and since and born < since}
+            born_at = {other: born for other in ends
+                       if other.parents[1].name == owner and other.stem not in found
+                       and (born := birthtime(other)) and since}
+            births = {other.stem: born for other, born in born_at.items() if born < since}
             if births:
                 found.update(older_tasks(transcript, births))
+            # A monitor's file appears with its first event, up to the monitor deadline
+            # after the call, so the call can lie further back than a shell task's,
+            # and before the tail even when the file does not. A running shell command
+            # holds its file, so only a file nothing holds can be a monitor.
+            late = {other.stem: born for other, born in born_at.items()
+                    if other.stem not in found and born < since + MONITOR_TIMEOUT_CAP / 1000
+                    and (held is None or str(other.resolve()) not in held)}
+            if late:
+                found.update(older_tasks(transcript, late, MONITOR_TIMEOUT_CAP / 1000))
         found, since, pending = titles[owner]
         born = getattr(info, 'st_birthtime', None)
         live = end is None and held is not None and str(path.resolve()) in held
@@ -392,7 +487,15 @@ def task_rows(project, now, session='*'):
             # covered transcript never reported as a background task is a foreground command.
             if since is not None and (since == 0 or (born and born >= since)):
                 continue
-        if end is None:
+        monitor = bool(detail and detail.get('monitor'))
+        if end is None and monitor:
+            # Nothing holds a monitor's file; it runs until its marker or deadline.
+            deadline = detail.get('deadline')
+            if deadline is not None:
+                state = 'running' if now < deadline else 'stopped'
+            else:
+                state = 'running' if detail.get('persistent') else 'unknown'
+        elif end is None:
             # No marker and no open handle: the command died with its session.
             state = 'unknown' if held is None else 'running' if live else 'stopped'
         else:
@@ -411,7 +514,46 @@ def task_rows(project, now, session='*'):
                           progress=percent, progress_label=label, left=left,
                           last_line=task_last_line(path),
                           exit_code=end if isinstance(end, int) else None,
-                          evidence='output end marker + lsof writable handle'))
+                          evidence='output end marker + ' + ('monitor deadline' if monitor
+                                                             else 'lsof writable handle')))
+    result.extend(waiting_monitors(project, now, session, titles, {path.stem for path in ends}))
+    return result
+
+
+def waiting_monitors(project, now, session, titles, files):
+    """Rows for monitors whose first event has not made their output file yet.
+
+    The call is recent: within the deadline cap, so its transcript was written
+    since then and only those transcripts are read, the tail and, when the tail
+    starts later, the stretch back to the cap. A monitor kept until the session
+    ends (persistent) has no deadline and no other sign of life, so it shows
+    only once it writes. One that ends before writing anything stays listed
+    until its deadline.
+    """
+    result, cap = [], MONITOR_TIMEOUT_CAP / 1000
+    for transcript in sorted(project.glob(session + '.jsonl')):
+        try:
+            if now - transcript.stat().st_mtime > cap:
+                continue
+        except OSError:
+            continue
+        owner = transcript.stem
+        if owner not in titles:
+            titles[owner] = task_details(transcript)
+        calls, since = dict(titles[owner][0]), titles[owner][1]
+        if since and since > now - cap:
+            for task, detail in monitor_window(transcript, now - cap, since).items():
+                calls.setdefault(task, detail)
+        for task, detail in calls.items():
+            deadline = detail.get('deadline')
+            if not detail.get('monitor') or task in files or deadline is None or now >= deadline:
+                continue
+            started = detail.get('started')
+            result.append(row('claude', 'task', task, project.name, started, 'running', detail['title'],
+                              parent=owner, mode='bg', command=detail.get('command'),
+                              uptime=max(0, int(now - started)) if started else None,
+                              progress=None, progress_label=None, left=None, last_line=None,
+                              exit_code=None, evidence='monitor call, no output yet + monitor deadline'))
     return result
 
 

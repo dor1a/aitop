@@ -136,7 +136,7 @@ aitop reads with `aibus ls --json --reader aitop`, so `aibus status` shows when 
 | `finished`, `failed` | A subagent handed its result back, or a command exited with code 0 or non-zero |
 | `ok`, `warn`, `late`, `gone` | From aibus: what a tool reported, a missed schedule, a process that ended without reporting |
 
-For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 20 stored command records per thread.
+For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. A `Monitor` watch is a background task too. Nothing holds its output file open, so it counts as running until its end marker or its deadline, and it shows from the call on, before its first event writes the file. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 20 stored command records per thread.
 
 Titles use command descriptions and program names, never arguments or output. The details pane shows the full command, up to five lines; the environment that names a Codex thread is never shown.
 
@@ -168,7 +168,7 @@ flowchart LR
 
 | Source | What aitop shows |
 | -- | -- |
-| Claude Code transcripts | Sessions, workflows, subagents and the shell commands they ran in the background |
+| Claude Code transcripts | Sessions, workflows, subagents, the shell commands they ran in the background, and their `Monitor` watches |
 | Codex SQLite and rollouts | Sessions and stored command records |
 | `lsof`, `ps` | Whether a Claude background command is still writing, and which Codex commands run now |
 | `aibus ls --json` | One group per source, all above the Claude and Codex groups with `mcp` first, and `aibus` in the `AI` column |
