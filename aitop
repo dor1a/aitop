@@ -19,7 +19,7 @@ import tempfile
 import time
 import unicodedata
 
-__version__ = '0.1.4'
+__version__ = '0.1.5'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
 # Hidden records stop being listed a day after their last update; this is a view of
 # what runs now, and older history ran to hundreds of rows behind l.
@@ -1138,6 +1138,8 @@ SELECTED_BG = 8
 MARKS_FILE = Path(os.environ.get('AITOP_MARKS_FILE') or Path.home() / '.local/state/aitop/marked.json')
 # Marked rows take an aqua (256-color 50) that no state uses, as in todo; green on 16-color terminals.
 MARK_COLOR = 50
+# Separates the hints in the key bar, as in todo.
+KEY_SEP = ' │ '
 
 
 def cell_width(text):
@@ -1428,18 +1430,18 @@ def tui_screen(rows, warnings, now, view, width, height):
     toggle = f"l {'hide' if view['show_all'] else 'show'} {hidden} hidden"
     count = (f'{len(marked)} marked  ' if marked else '') + f'{len(shown)} shown '
     if view['typing'] is not None:
-        hint = f' /{view["typing"]}▏  Enter apply  Esc cancel'
+        hint = f' /{view["typing"]}▏  Enter apply │ Esc cancel'
     else:
         hints = (['↑↓ move', '⏎ details', 'space mark', toggle, 'a AI', '/ search']
                  + (['Esc clear search'] if view['query'] else ['Esc clear marks'] if marked else []) + ['q quit'])
         # On a narrow pane the hints give way, least needed first, so l and its count stay.
         for old, new in [('/ search', None), ('a AI', None), ('space mark', None), ('⏎ details', None),
                          ('Esc clear search', None), ('Esc clear marks', None), ('↑↓ move', None), ('q quit', None)]:
-            if cell_width(' ' + '  '.join(hints)) <= width - cell_width(count):
+            if cell_width(' ' + KEY_SEP.join(hints)) <= width - cell_width(count):
                 break
             if old in hints:
                 hints[hints.index(old):hints.index(old) + 1] = [new] if new else []
-        hint = ' ' + '  '.join(hints)
+        hint = ' ' + KEY_SEP.join(hints)
     bottom.append(([(fit(hint, width - cell_width(count)) + count, 'bar')], False, None))
     # On a short screen the details and warnings give way from the bottom; the key bar and one row stay.
     while len(bottom) > 1 and len(top) + 1 + len(bottom) > height:
