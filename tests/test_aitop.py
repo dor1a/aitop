@@ -4,6 +4,7 @@ import json
 import io
 import os
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import sqlite3
@@ -828,6 +829,242 @@ class ClaudeTaskTests(unittest.TestCase):
                     self.assertEqual([r['id'] for r in status.task_rows(project, 0)], ['old'])
                 self.assertEqual(status.task_details(transcript), ({}, 0, []))
                 self.assertEqual(status.task_rows(project, 0), [])
+
+
+def local(*parts):
+    return datetime(*parts).timestamp()
+
+
+CRON_EXPIRY = 30 * 86400
+
+
+class ClaudeCronTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.addCleanup(status.CACHE.clear)
+        self.project = self.dir / 'projects/-work-project'
+        self.project.mkdir(parents=True)
+        self.transcript = self.project / 'session-1.jsonl'
+
+    @staticmethod
+    def call(name, call_id, when, given, result=None, error=False, text='ok'):
+        return [dict(type='assistant', timestamp=when, message=dict(content=[dict(
+                    type='tool_use', id=call_id, name=name, input=given)])),
+                dict(type='user', timestamp=when + 1, toolUseResult=result, message=dict(content=[dict(
+                    type='tool_result', tool_use_id=call_id, content=text, is_error=error)]))]
+
+    def create(self, call_id, job, when, cron, first, recurring=False, prompt='예약'):
+        return self.call('CronCreate', call_id, when, dict(cron=cron, recurring=recurring, prompt=prompt),
+                         dict(id=job, humanSchedule=cron, recurring=recurring, durable=False,
+                              nextFireAt=int(first * 1000)))
+
+    @staticmethod
+    def fired(when, prompt):
+        # Claude Code sends the prompt with no job ID, after a queue record of the same text.
+        return [dict(type='queue-operation', operation='enqueue', timestamp=when, content=prompt),
+                dict(type='user', timestamp=when, isMeta=True, turnOrigin='scheduled', promptSource='system',
+                     wakeupSource='schedule_wakeup', message=dict(role='user', content=prompt))]
+
+    def write(self, entries, mode='w'):
+        # Claude Code writes compact JSON with the text as it is.
+        with self.transcript.open(mode) as stream:
+            stream.write(''.join(json.dumps(e, separators=(',', ':'), ensure_ascii=False) + '\n'
+                                 for e in entries))
+
+    def test_jobs_follow_their_create_list_and_delete_results(self):
+        now = local(2026, 11, 25, 11, 0)
+        start = local(2026, 11, 25, 10, 40)
+        self.write(
+            self.create('c1', 'once', start, '7 14 25 11 *', local(2026, 11, 25, 14, 7),
+                        prompt='\n첫 줄\n둘째 줄')
+            # Every ten minutes, three minutes late: the first run says so.
+            + self.create('c2', 'every', start + 60, '*/10 * * * *', local(2026, 11, 25, 10, 53),
+                          recurring=True, prompt='매번')
+            + self.create('c3', 'gone', start + 120, '9 9 * * *', local(2026, 11, 26, 9, 9))
+            + self.call('CronDelete', 'd3', start + 180, dict(id='gone'), dict(id='gone'),
+                        text='Cancelled job gone.')
+            + self.create('c4', 'ran', start + 240, '45 10 25 11 *', local(2026, 11, 25, 10, 45))
+            + self.call('CronCreate', 'c5', start + 300, dict(cron='bad', prompt='x'), error=True,
+                        text='Error: invalid cron')
+            + self.call('CronDelete', 'd6', start + 360, dict(id='once'), error=True, text='No job once')
+            # A listing is the whole set: the one-shot job that ran is no longer in it.
+            + self.call('CronList', 'l7', start + 420, {}, dict(jobs=[
+                dict(id='once', cron='7 14 25 11 *', humanSchedule='7 14 25 11 *', prompt='\n첫 줄\n둘째 줄',
+                     durable=False, nextFireAt=int(local(2026, 11, 25, 14, 7) * 1000)),
+                dict(id='every', cron='*/10 * * * *', humanSchedule='*/10 * * * *', prompt='매번',
+                     recurring=True, durable=False, nextFireAt=int(local(2026, 11, 25, 10, 53) * 1000))]))
+            + self.fired(local(2026, 11, 25, 10, 53, 10), '매번'))
+        rows = {r['id']: r for r in status.cron_rows(self.project, now, {'session-1': None})}
+        self.assertEqual(sorted(rows), ['every', 'once'])
+        once, every = rows['once'], rows['every']
+        self.assertEqual((once['kind'], once.get('mode'), once['state'], once['parent']),
+                         ('schedule', None, 'scheduled', 'session-1'))
+        # The live view lists them apart from the commands that run now.
+        self.assertEqual(status.tui_group(once), 'schedule')
+        self.assertEqual([kind for kind, _ in status.tui_groups([once])][2:4], ['bg-task', 'schedule'])
+        self.assertEqual((once['title'], once['task']), ('첫 줄', '\n첫 줄\n둘째 줄'))
+        self.assertEqual(once['left'], local(2026, 11, 25, 14, 7) - now)
+        self.assertEqual(once['last_line'], 'next 14:07, once, cron 7 14 25 11 *')
+        self.assertEqual(once['uptime'], 1200)
+        # The run at 11:00 goes at 11:03, three minutes late like the first one.
+        self.assertEqual(every['next_run'], local(2026, 11, 25, 11, 3))
+        self.assertEqual(every['last_line'], 'next 11:03, repeats, cron */10 * * * *')
+        # Only running sessions hold jobs.
+        self.assertEqual(status.cron_rows(self.project, now, {}), [])
+        self.assertEqual(status.cron_rows(self.project, now, {'session-9': None}), [])
+        # A one-shot job past its time waits for the session to go idle.
+        late = {r['id']: r for r in status.cron_rows(self.project, local(2026, 11, 25, 14, 9),
+                                                     {'session-1': None})}['once']
+        self.assertEqual((late['state'], late['left']), ('due', None))
+        self.assertEqual(late['last_line'], 'due 14:07, runs once the session is idle, cron 7 14 25 11 *')
+        # A recurring job is gone 30 days after it was made.
+        self.assertEqual([r['id'] for r in status.cron_rows(self.project, start + 32 * 86400,
+                                                            {'session-1': None})], ['once'])
+
+    def test_a_one_shot_job_that_ran_is_gone(self):
+        start = local(2026, 11, 25, 10, 0)
+        fired = self.fired
+        self.write(self.create('c1', 'soon', start, '30 10 25 11 *', start + 1740, prompt='점검')
+                   + self.create('c2', 'later', start + 60, '0 15 25 11 *', start + 18000, prompt='점검')
+                   + self.create('c3', 'hourly', start + 120, '7 * * * *', start + 420, recurring=True,
+                                 prompt='매시 점검')
+                   # The :30 job ran a minute early; a wakeup with some other prompt matches nothing.
+                   + fired(start + 1745 - 60, '점검') + fired(start + 1800, '다른 일')
+                   + fired(start + 420, '매시 점검'))
+        self.assertEqual(sorted(status.cron_jobs(self.transcript)), ['hourly', 'later'])
+        # The same prompt again, hours before the other job is due, is not that job running.
+        self.write(fired(start + 3600, '점검'), mode='a')
+        self.assertEqual(sorted(status.cron_jobs(self.transcript)), ['hourly', 'later'])
+        self.write(fired(start + 18000, '점검'), mode='a')
+        self.assertEqual(sorted(status.cron_jobs(self.transcript)), ['hourly'])
+
+    def test_a_recurring_run_stays_due_until_it_goes_in(self):
+        start = local(2026, 11, 25, 10, 1)
+        self.write(self.create('c1', 'ten', start, '*/10 * * * *', local(2026, 11, 25, 10, 10, 30),
+                               recurring=True, prompt='점검')
+                   + self.create('c2', 'once', start + 60, '11 10 25 11 *', local(2026, 11, 25, 10, 11),
+                                 prompt='점검'))
+        due = lambda job, now: status.cron_due(status.cron_jobs(self.transcript)[job], now)
+        # The session was busy at 10:10:30, so that run has not gone in yet.
+        self.assertEqual(due('ten', local(2026, 11, 25, 10, 10, 31)), local(2026, 11, 25, 10, 10, 30))
+        # The recurring job sends the shared prompt at 10:10:40; the one-shot job still waits for 10:11.
+        self.write(self.fired(local(2026, 11, 25, 10, 10, 40), '점검'), mode='a')
+        self.assertEqual(sorted(status.cron_jobs(self.transcript)), ['once', 'ten'])
+        self.assertEqual(due('ten', local(2026, 11, 25, 10, 10, 41)), local(2026, 11, 25, 10, 20, 30))
+        self.write(self.fired(local(2026, 11, 25, 10, 11, 2), '점검'), mode='a')
+        self.assertEqual(sorted(status.cron_jobs(self.transcript)), ['ten'])
+
+    def test_a_recurring_job_shows_until_its_last_run(self):
+        made = local(2026, 10, 26, 9, 59)
+        self.write(self.create('c1', 'daily', made, '0 10 * * *', local(2026, 10, 26, 10, 0), recurring=True,
+                               prompt='매일 점검')
+                   + self.fired(local(2026, 10, 26, 10, 0, 5), '매일 점검'))
+        rows = lambda now: [(r['id'], r['state']) for r in status.cron_rows(self.project, now, {'session-1': None})]
+        # Thirty days on, the last run is waiting for the busy session.
+        self.assertEqual(rows(made + 1 + CRON_EXPIRY), [('daily', 'due')])
+        self.assertEqual(rows(made + CRON_EXPIRY + 86400 + 1), [])
+        # It went in with a note added, and the job is gone.
+        self.write(self.fired(made + CRON_EXPIRY + 600, '매일 점검\n\n(This is the last run.)'), mode='a')
+        self.assertEqual(rows(made + CRON_EXPIRY + 601), [])
+
+    def test_run_times_are_read_with_care(self):
+        start = local(2026, 11, 25, 10, 0)
+        # A run time past year 3000 is unknown, and the input's cron wins over the result's text.
+        self.write(self.call('CronCreate', 'c1', start, dict(cron='7 14 25 11 *', recurring=False, prompt='p'),
+                             dict(id='far', humanSchedule='at 2:07pm', recurring=False, nextFireAt=10 ** 17)))
+        row = status.cron_rows(self.project, start + 60, {'session-1': None})[0]
+        self.assertEqual((row['schedule'], row['next_run'], row['left']), ('7 14 25 11 *', None, None))
+
+    @unittest.skipUnless(hasattr(time, 'tzset'), 'time.tzset is unavailable')
+    def test_cron_meets_the_repeated_hour_when_clocks_go_back(self):
+        old = os.environ.get('TZ')
+
+        def restore():
+            if old is None:
+                os.environ.pop('TZ', None)
+            else:
+                os.environ['TZ'] = old
+            time.tzset()
+        self.addCleanup(restore)
+        os.environ['TZ'] = 'America/New_York'
+        time.tzset()
+        # 2026-11-01 06:10 UTC is 01:10 EST, the second time 01:10 comes round.
+        after = datetime(2026, 11, 1, 6, 10, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(status.cron_after('*/15 * * * *', after),
+                         datetime(2026, 11, 1, 6, 15, tzinfo=timezone.utc).timestamp())
+        # 05:50 UTC is 01:50 EDT: 01:55 EDT comes before 01:00 EST.
+        after = datetime(2026, 11, 1, 5, 50, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(status.cron_after('*/5 * * * *', after),
+                         datetime(2026, 11, 1, 5, 55, tzinfo=timezone.utc).timestamp())
+
+    def test_later_lines_update_the_jobs_and_earlier_processes_do_not_count(self):
+        start = local(2026, 11, 25, 10, 0)
+        self.write(self.create('c1', 'old', start, '5 * * * *', start + 300, recurring=True)
+                   + self.create('c2', 'new', start + 600, '7 * * * *', start + 4020, recurring=True))
+        self.assertEqual(sorted(status.cron_jobs(self.transcript)), ['new', 'old'])
+        # The process started after the first job was made, so that one died with the last process.
+        self.assertEqual(sorted(status.cron_jobs(self.transcript, start + 300)), ['new'])
+        jobs = status.cron_jobs(self.transcript)
+        self.assertIs(status.cron_jobs(self.transcript), jobs)
+        # A delete whose result lands after the read still takes the job away.
+        self.write(self.call('CronDelete', 'd3', start + 900, dict(id='new'), dict(id='new')), mode='a')
+        self.assertEqual(sorted(status.cron_jobs(self.transcript)), ['old'])
+        self.assertEqual(sorted(status.cron_jobs(self.transcript, start + 300)), [])
+
+    def test_cron_matches_minutes_and_days_like_cron(self):
+        after = status.cron_after
+        self.assertEqual(after('*/5 * * * *', local(2026, 11, 25, 11, 0, 30)), local(2026, 11, 25, 11, 5))
+        # The next run is after the given time, never at it.
+        self.assertEqual(after('*/5 * * * *', local(2026, 11, 25, 11, 5)), local(2026, 11, 25, 11, 10))
+        self.assertEqual(after('7 14 25 11 *', local(2026, 11, 25, 11, 0)), local(2026, 11, 25, 14, 7))
+        self.assertEqual(after('7 14 25 11 *', local(2026, 11, 25, 14, 7)), local(2027, 11, 25, 14, 7))
+        self.assertEqual(after('30 9-17/4 * * 1-5', local(2026, 11, 28, 12, 0)), local(2026, 11, 30, 9, 30))
+        # 2026-11-25 is a Wednesday. With both day fields set either one matches.
+        self.assertEqual(after('0 9 1 * 1', local(2026, 11, 25, 12, 0)), local(2026, 11, 30, 9, 0))
+        self.assertEqual(after('0 9 1 * *', local(2026, 11, 25, 12, 0)), local(2026, 12, 1, 9, 0))
+        self.assertEqual(after('0 9 * * 7', local(2026, 11, 25, 12, 0)), local(2026, 11, 29, 9, 0))
+        self.assertEqual(after('0 0 29 2 *', local(2026, 11, 25, 12, 0)), local(2028, 2, 29, 0, 0))
+        for unknown in ('0 9 * * MON', '61 * * * *', '* * *', '*/0 * * * *', '5-1 * * * *'):
+            with self.subTest(unknown=unknown):
+                self.assertIsNone(after(unknown, local(2026, 11, 25, 12, 0)))
+        # Without a known run there is no offset to keep.
+        self.assertEqual(status.cron_due(dict(recurring=True, cron='*/10 * * * *', next=None),
+                                         local(2026, 11, 25, 11, 1)), local(2026, 11, 25, 11, 10))
+
+    def test_running_sessions_need_their_process_with_the_same_start(self):
+        sessions = self.dir / 'sessions'
+        sessions.mkdir()
+        probe = subprocess.run(['ps', '-o', 'lstart=', '-p', str(os.getpid())], capture_output=True, text=True,
+                               env=dict(os.environ, LC_ALL='C', TZ='UTC'))
+        ended = subprocess.Popen(['true'])
+        ended.wait()
+        for pid, session, started in ((os.getpid(), 'me', probe.stdout.strip()),
+                                      (os.getppid(), 'reused', 'Thu Jan  1 00:00:00 1970'),
+                                      (ended.pid, 'ended', '')):
+            (sessions / f'{pid}.json').write_text(json.dumps(dict(
+                pid=pid, sessionId=session, procStart=started, startedAt=1795393589470,
+                pidDomain=status.sys.platform)))
+        (sessions / 'other.json').write_text(json.dumps(dict(pid=1, sessionId='vm', pidDomain='elsewhere')))
+        self.assertEqual(status.claude_processes(self.dir), {'me': 1795393589.47})
+        # A process that exited but was not reaped yet keeps its start time, not its jobs.
+        exited = subprocess.Popen(['true'])
+        self.addCleanup(exited.wait)
+        # Linux lists it as Z with its start time; macOS may not list it at all.
+        for _ in range(100):
+            state = subprocess.run(['ps', '-o', 'stat=,lstart=', '-p', str(exited.pid)], capture_output=True,
+                                   text=True, env=dict(os.environ, LC_ALL='C', TZ='UTC')).stdout.split(None, 1)
+            if not state or state[0].startswith('Z'):
+                break
+            time.sleep(0.02)
+        self.assertTrue(not state or state[0].startswith('Z'), state)
+        (sessions / f'{exited.pid}.json').write_text(json.dumps(dict(
+            pid=exited.pid, sessionId='zombie', procStart=state[1].strip() if state else '',
+            pidDomain=status.sys.platform)))
+        self.assertEqual(status.claude_processes(self.dir), {'me': 1795393589.47})
+        with patch.object(status.subprocess, 'run', side_effect=OSError):
+            self.assertIsNone(status.claude_processes(self.dir))
+        self.assertEqual(status.claude_processes(self.dir / 'missing'), {})
 
 
 class HistoryLimitTests(unittest.TestCase):

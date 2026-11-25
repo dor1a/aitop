@@ -6,7 +6,7 @@
 
 **A live view of what Claude Code and Codex are running on this machine**
 
-Sessions, workflows, subagents and background shell commands in one screen, refreshed every second.<br>
+Sessions, workflows, subagents, background shell commands and scheduled jobs in one screen, refreshed every second.<br>
 Read-only: it never starts, resumes or stops anything.
 
 [![macOS | Linux | WSL](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20WSL-supported-555555)](#install)
@@ -59,7 +59,7 @@ To update, run `brew upgrade aitop`, or `git pull` in the clone.
 
 aitop needs Python 3.9 or later and uses only the standard library, so the macOS `/usr/bin/python3` is enough.
 
-`lsof` and `ps` are optional: without them a Claude background command shows as `unknown` and live Codex commands are not listed. [aibus](https://github.com/dor1a/aibus) is optional too; without it there are simply no aibus groups.
+`lsof` and `ps` are optional: without them a Claude background command shows as `unknown`, live Codex commands are not listed, and Claude scheduled jobs do not show. [aibus](https://github.com/dor1a/aibus) is optional too; without it there are simply no aibus groups.
 
 ## Usage
 
@@ -95,7 +95,7 @@ aitop --plain --kind mcp  # only what aibus lists under mcp
 | -- | -- |
 | `-a` | Both AIs, every kind, every project, plus aibus entries |
 | `--ai claude\|codex\|both` | One AI. In the table, the scope stays on the nearest recorded project unless `--all-projects` widens it |
-| `--kind KIND` | `session`, `workflow`, `agent`, `task`, `bg-task`, or an aibus source such as `mcp` |
+| `--kind KIND` | `session`, `workflow`, `agent`, `task`, `bg-task`, `schedule`, or an aibus source such as `mcp` |
 | `-l` | Include completed, stopped, failed and archived records, and aibus entries that last reported `ok`. These are listed for 24 hours after their last update |
 | `-v` | Add model, task and parent IDs to the table |
 
@@ -135,8 +135,9 @@ aitop reads with `aibus ls --json --reader aitop`, so `aibus status` shows when 
 | `turn-complete` | The last turn ended. Not proof that the whole task succeeded |
 | `finished`, `failed` | A subagent handed its result back, or a command exited with code 0 or non-zero |
 | `ok`, `warn`, `late`, `gone` | From aibus: what a tool reported, a missed schedule, a process that ended without reporting |
+| `scheduled`, `due` | A job a Claude session scheduled, before its time, or past it and waiting for the session to go idle |
 
-For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. A `Monitor` watch is a background task too. Nothing holds its output file open, so it counts as running until its end marker or its deadline, and it shows from the call on, before its first event writes the file. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 20 stored command records per thread.
+For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. A `Monitor` watch is a background task too. Nothing holds its output file open, so it counts as running until its end marker or its deadline, and it shows from the call on, before its first event writes the file. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. A job scheduled with `CronCreate` is listed under Scheduled while the Claude process that made it runs, since Claude Code keeps those jobs only in memory. aitop follows the `CronCreate`, `CronList` and `CronDelete` results in the transcript, and drops a one-shot job once its prompt comes back as a scheduled turn. For a job, `LEFT` is the time to its next run. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 20 stored command records per thread.
 
 Titles use command descriptions and program names, never arguments or output. The details pane shows the full command, up to five lines; the environment that names a Codex thread is never shown.
 
@@ -148,16 +149,18 @@ aitop only reads what is already on disk and in the process table. Claude Code a
 flowchart LR
   subgraph agents["Agents"]
     CT["Claude Code transcripts<br/>~/.claude/projects"]
+    SE["Claude Code session files<br/>~/.claude/sessions"]
     CO["Codex SQLite and rollouts<br/>~/.codex"]
   end
   subgraph host["This machine"]
     LS["lsof<br/>is a background command still writing?"]
-    PS["ps<br/>Codex commands by CODEX_THREAD_ID"]
+    PS["ps<br/>Codex commands by CODEX_THREAD_ID,<br/>Claude session processes"]
   end
   subgraph tools["Tools next to the agents"]
     BUS[("aibus<br/>~/.local/state/aibus")]
   end
   CT --> A["aitop"]
+  SE --> A
   CO --> A
   LS --> A
   PS --> A
@@ -168,9 +171,10 @@ flowchart LR
 
 | Source | What aitop shows |
 | -- | -- |
-| Claude Code transcripts | Sessions, workflows, subagents, the shell commands they ran in the background, and their `Monitor` watches |
+| Claude Code transcripts | Sessions, workflows, subagents, the shell commands they ran in the background, their `Monitor` watches, and the jobs they scheduled with `CronCreate` |
+| Claude Code session files | Which Claude sessions still run, so their scheduled jobs show only while they do |
 | Codex SQLite and rollouts | Sessions and stored command records |
-| `lsof`, `ps` | Whether a Claude background command is still writing, and which Codex commands run now |
+| `lsof`, `ps` | Whether a Claude background command is still writing, whether a Claude session file still names a running process, and which Codex commands run now |
 | `aibus ls --json` | One group per source, all above the Claude and Codex groups with `mcp` first, and `aibus` in the `AI` column |
 
 A transcript is parsed again only when its size or modification time changes, so finished sessions and agents cost almost nothing between passes.

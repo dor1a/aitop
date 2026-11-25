@@ -2,7 +2,7 @@
 """Read Claude/Codex local status without starting or resuming sessions."""
 import argparse
 from contextlib import closing, contextmanager
-from datetime import datetime
+from datetime import datetime, time as clock, timedelta
 import fcntl
 import functools
 import json
@@ -19,7 +19,7 @@ import tempfile
 import time
 import unicodedata
 
-__version__ = '0.1.6'
+__version__ = '0.1.7'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
 # Hidden records stop being listed a day after their last update; this is a view of
 # what runs now, and older history ran to hundreds of rows behind l.
@@ -630,9 +630,341 @@ def task_notices(path):
     return found
 
 
+# Claude Code keeps ~/.claude/sessions/<pid>.json while a process runs, naming its
+# session and when the process started (procStart, as `ps -o lstart` prints it in UTC).
+# A file left by a process that crashed names a PID that is gone or reused.
+def claude_processes(home):
+    """Session IDs of running Claude Code processes, with when each process started.
+
+    Returns None when the processes cannot be inspected.
+    """
+    entries = {}
+    for path in sorted((home / 'sessions').glob('*.json')):
+        data = read_object(path)
+        pid, session = data.get('pid'), data.get('sessionId')
+        if (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(session, str)
+                and data.get('pidDomain', sys.platform) == sys.platform):
+            entries[pid] = data
+    if not entries:
+        return {}
+    try:
+        probe = subprocess.run(['ps', '-o', 'pid=,stat=,lstart=', '-p', ','.join(map(str, entries))],
+                               capture_output=True, text=True, timeout=5,
+                               env=dict(os.environ, LC_ALL='C', TZ='UTC'))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    started = {}
+    for line in probe.stdout.splitlines():
+        parts = line.split(None, 2)
+        # A process that exited but was not reaped yet (Z) has lost its jobs already.
+        if len(parts) == 3 and parts[0].isdigit() and not parts[1].startswith('Z'):
+            started[int(parts[0])] = ' '.join(parts[2].split())
+    result = {}
+    for pid, data in entries.items():
+        expected = ' '.join(str(data.get('procStart') or '').split())
+        if pid in started and (not expected or expected == started[pid]):
+            result[data['sessionId']] = timestamp(data.get('startedAt')) or None
+    return result
+
+
+# CronCreate jobs live in the Claude process that made them: nothing is written to
+# disk and they end with it. The transcript keeps the calls and their results:
+# CronCreate answers {id, humanSchedule, recurring, nextFireAt}, CronList {jobs: [...]}
+# and CronDelete {id}.
+CRON_TOOLS = ('CronCreate', 'CronDelete', 'CronList')
+# Claude Code writes compact JSON, so a call names its tool exactly like this.
+CRON_CALLS = tuple(f'"name":"{name}"'.encode() for name in CRON_TOOLS)
+# A job that fires sends its prompt as a user record marked turnOrigin "scheduled",
+# without the job ID, so the prompt is the only link back to the job.
+CRON_FIRED = b'"turnOrigin":"scheduled"'
+# A one-shot job landing on :00 or :30 runs up to 90 seconds early.
+CRON_EARLY = 120
+CRON_JOB = re.compile(r'task (\w+) \(')
+# Recurring jobs fire a last time and are deleted 30 days after they are made. That
+# last run carries a note, so it may not be recognized; a day later the job is dropped.
+CRON_EXPIRY = 30 * 86400
+CRON_LAST_RUN = 86400
+# Run times past year 3000 are not real and would not convert to a date.
+CRON_TIME_CAP = 32503680000
+# A recurring job runs up to half its period late, 30 minutes at most, by an offset
+# fixed per job.
+CRON_LATE_CAP = 1800
+CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+# Feb 29 on a given weekday can be years away.
+CRON_SEARCH_DAYS = 5 * 366
+
+
+def cron_marks(calls):
+    """Byte strings a line needs to matter: a cron call, a fired job, or the result of a call still open.
+
+    A result names its call's ID, not the tool.
+    """
+    return CRON_CALLS + (CRON_FIRED,) + tuple(f'"tool_use_id":"{call}"'.encode() for call in calls)
+
+
+def cron_time(value):
+    """A run time from a result, or None when it is missing or out of range."""
+    when = timestamp(value)
+    return when if 0 < when < CRON_TIME_CAP else None
+
+
+def cron_fired(record, jobs):
+    """A scheduled prompt went in: a one-shot job that sent it is gone, a recurring one ran."""
+    content = record.get('message', {}).get('content')
+    if isinstance(content, list):
+        content = ''.join(part.get('text', '') for part in content
+                          if isinstance(part, dict) and part.get('type') == 'text')
+    if not isinstance(content, str):
+        return
+    at, text = timestamp(record.get('timestamp')), content.strip()
+    candidates = []
+    for job, detail in jobs.items():
+        prompt = detail.get('prompt', '').strip()
+        # The last run of a recurring job adds a note to its prompt; any other run sends it as it is.
+        last = detail['recurring'] and at >= (detail.get('created') or at) + CRON_EXPIRY - CRON_LATE_CAP
+        if not prompt or (prompt != text and not (last and prompt in text)):
+            continue
+        pending = cron_pending(detail)
+        if pending is None or pending <= at + CRON_EARLY:
+            candidates.append((prompt != text, pending or 0, job))
+    if not candidates:
+        return
+    # Two jobs can share a prompt: the exact one, then the one waiting longest, is the one that ran.
+    job = min(candidates)[2]
+    detail = jobs[job]
+    if detail['recurring'] and at < (detail.get('created') or at) + CRON_EXPIRY:
+        detail['ran'] = at
+    else:
+        del jobs[job]
+
+
+def cron_record(record, calls, jobs):
+    """Apply one transcript record to the scheduled jobs it creates, lists, deletes or runs."""
+    kind = record.get('type')
+    if kind == 'user' and record.get('turnOrigin') == 'scheduled':
+        cron_fired(record, jobs)
+        return
+    content = record.get('message', {}).get('content')
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if kind == 'assistant' and block.get('type') == 'tool_use' and block.get('name') in CRON_TOOLS:
+            given = block.get('input')
+            calls[block.get('id')] = (block['name'], given if isinstance(given, dict) else {},
+                                      timestamp(record.get('timestamp')))
+            continue
+        if not (kind == 'user' and block.get('type') == 'tool_result' and block.get('tool_use_id') in calls):
+            continue
+        name, given, at = calls.pop(block['tool_use_id'])
+        if block.get('is_error'):
+            continue
+        result = record.get('toolUseResult')
+        result = result if isinstance(result, dict) else {}
+        if name == 'CronCreate':
+            job = result.get('id')
+            if not isinstance(job, str):
+                found = CRON_JOB.search(json.dumps(block.get('content'), ensure_ascii=False))
+                job = found and found.group(1)
+            recurring = result.get('recurring')
+            if job:
+                jobs[job] = dict(cron=str(given.get('cron') or result.get('humanSchedule') or ''),
+                                 recurring=recurring if isinstance(recurring, bool)
+                                 else given.get('recurring') is not False,
+                                 prompt=str(given.get('prompt') or ''), created=at,
+                                 next=cron_time(result.get('nextFireAt')), ran=None)
+        elif name == 'CronDelete':
+            jobs.pop(result.get('id') or given.get('id'), None)
+        elif name == 'CronList' and isinstance(result.get('jobs'), list):
+            # A listing is the whole set at that time: a job missing from it has run or gone.
+            listed = {item['id']: item for item in result['jobs']
+                      if isinstance(item, dict) and isinstance(item.get('id'), str)}
+            for job in set(jobs) - set(listed):
+                del jobs[job]
+            for job, item in listed.items():
+                known = jobs.setdefault(job, dict(created=at, recurring=item.get('recurring') is True,
+                                                  cron='', prompt='', next=None, ran=None))
+                known['cron'] = str(item.get('cron') or item.get('humanSchedule') or known['cron'])
+                known['prompt'] = str(item.get('prompt') or known['prompt'])
+                known['next'] = cron_time(item.get('nextFireAt')) or known['next']
+
+
+def cron_jobs(path, since=None):
+    """Jobs a session transcript scheduled and has not seen end, by job ID.
+
+    Jobs end with their process, so only the stretch written since `since`, when that
+    process started, can hold live ones. Like task_notices, a pass reads only the
+    complete lines appended since the previous one.
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return {}
+    key = ('crons', str(path), since)
+    USED.add(key)
+    inode, offset, calls, jobs = CACHE.get(key, (info.st_ino, None, {}, {}))
+    if inode != info.st_ino or (offset is not None and info.st_size < offset):
+        offset, calls, jobs = None, {}, {}
+    if info.st_size == offset:
+        return jobs
+    calls, jobs = dict(calls), {job: dict(value) for job, value in jobs.items()}
+    try:
+        with path.open('rb') as stream:
+            if offset is None:
+                offset = stamp_offset(stream, stream.seek(0, 2), since) if since else 0
+                stream.seek(offset)
+                if offset:
+                    offset += len(stream.readline())
+            stream.seek(offset)
+            pending = b''
+            while True:
+                block = stream.read(4 * READ_CAP)
+                if not block:
+                    break
+                block = pending + block
+                cut = block.rfind(b'\n') + 1
+                done, pending = block[:cut], block[cut:]
+                offset += cut
+                marks = cron_marks(calls)
+                if not any(mark in done for mark in marks):
+                    continue
+                for line in done.split(b'\n'):
+                    if not any(mark in line for mark in marks):
+                        continue
+                    record = object_json(line)
+                    # The read starts near the process start; jobs made before it are gone.
+                    if not since or timestamp(record.get('timestamp')) >= since:
+                        cron_record(record, calls, jobs)
+                        marks = cron_marks(calls)
+    except OSError:
+        return jobs
+    CACHE[key] = (info.st_ino, offset, calls, jobs)
+    return jobs
+
+
+def cron_values(field, low, high):
+    """The numbers one cron field allows; ValueError for anything but numbers, *, -, / and lists."""
+    values = set()
+    for part in field.split(','):
+        body, slash, step = part.partition('/')
+        if body == '*':
+            start, end = low, high
+        elif '-' in body:
+            start, end = map(int, body.split('-', 1))
+        else:
+            start = int(body)
+            end = high if slash else start
+        step = int(step) if slash else 1
+        if not low <= start <= end <= high or step < 1:
+            raise ValueError(field)
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def cron_after(expression, after):
+    """The first local minute after `after` that a five-field cron expression matches, or None."""
+    fields = str(expression).split()
+    try:
+        if len(fields) != 5:
+            raise ValueError(expression)
+        minutes, hours, days, months, weekdays = (sorted(cron_values(field, *limits))
+                                                  for field, limits in zip(fields, CRON_RANGES))
+    except ValueError:
+        return None
+    weekdays = {day % 7 for day in weekdays}
+    # As in cron, a day matches either day field when both are restricted.
+    either = not fields[2].startswith('*') and not fields[4].startswith('*')
+    start = (math.floor(after / 60) + 1) * 60
+    day = datetime.fromtimestamp(after).date()
+    for _ in range(CRON_SEARCH_DAYS):
+        dated, weekday = day.day in days, (day.weekday() + 1) % 7 in weekdays
+        if day.month in months and ((dated or weekday) if either else (dated and weekday)):
+            best = None
+            for hour in hours:
+                for minute in minutes:
+                    moment = datetime.combine(day, clock(hour, minute))
+                    first = moment.timestamp()
+                    if best is not None and first >= best:
+                        return best
+                    # When clocks go back, the repeated hour comes round a second time (fold=1).
+                    for when in (first, moment.replace(fold=1).timestamp()):
+                        if when >= start and (best is None or when < best):
+                            best = when
+            if best is not None:
+                return best
+        day += timedelta(days=1)
+    return None
+
+
+def cron_offset(job):
+    """How late every run of a recurring job comes, told by its one known run."""
+    known = job.get('next')
+    if not known:
+        return 0
+    match, at = None, known - CRON_LATE_CAP - 60
+    while (found := cron_after(job.get('cron'), at)) is not None and found <= known:
+        match, at = found, found
+    return known - match if match is not None else 0
+
+
+def cron_pending(job):
+    """The run a job has not made yet, or None when that cannot be told.
+
+    That is the known run until the transcript shows a run at or after it, then the
+    one after the latest run. A run the session was too busy for stays pending.
+    """
+    known, ran = job.get('next'), job.get('ran')
+    if not job.get('recurring') or ran is None or (known and ran < known - CRON_EARLY):
+        return known
+    offset = cron_offset(job)
+    found = cron_after(job.get('cron'), ran - offset)
+    return None if found is None else found + offset
+
+
+def cron_due(job, now):
+    """When a scheduled job runs next. A time in the past runs once the session is idle."""
+    due = cron_pending(job)
+    if due is None and job.get('recurring') and not job.get('next'):
+        due = cron_after(job.get('cron'), now)
+    return due
+
+
+def cron_rows(project, now, live):
+    """Rows for the jobs running Claude sessions of one project directory have scheduled."""
+    result = []
+    for session, started in sorted(live.items()):
+        transcript = project / (session + '.jsonl')
+        if not transcript.is_file():
+            continue
+        for job, detail in sorted(cron_jobs(transcript, started).items()):
+            created = detail.get('created') or now
+            if detail['recurring'] and now > created + CRON_EXPIRY + CRON_LAST_RUN:
+                continue
+            due = cron_due(detail, now)
+            when = '' if due is None else datetime.fromtimestamp(due).strftime(
+                '%H:%M' if datetime.fromtimestamp(due).date() == datetime.fromtimestamp(now).date()
+                else '%m-%d %H:%M')
+            if due is None:
+                note = ''
+            elif due > now:
+                note = f"next {when}, {'repeats' if detail['recurring'] else 'once'}, "
+            else:
+                note = f'due {when}, runs once the session is idle, '
+            prompt = detail.get('prompt') or ''
+            title = next((line for line in prompt.splitlines() if line.strip()), '') or '(no prompt)'
+            result.append(row('claude', 'schedule', job, project.name, created,
+                              'due' if due is not None and due <= now else 'scheduled', clean(title, 120),
+                              parent=session, command='cron ' + detail['cron'], task=prompt,
+                              schedule=detail['cron'], next_run=due,
+                              uptime=max(0, int(now - created)), progress=None, progress_label=None,
+                              left=due - now if due and due > now else None,
+                              last_line=note + 'cron ' + detail['cron'], exit_code=None,
+                              evidence='CronCreate result in the transcript + running session process'))
+    return result
+
+
 class ClaudeReader:
     def __init__(self, root):
-        self.root = root / 'projects'
+        self.home, self.root = root, root / 'projects'
 
     def read(self, project, all_projects, now):
         roots = sorted(self.root.glob('*')) if all_projects else []
@@ -642,7 +974,7 @@ class ClaudeReader:
                 if candidate.is_dir():
                     roots = [candidate]
                     break
-        result = []
+        result, live = [], None
         for root in roots:
             for path in root.glob('*.jsonl'):
                 session = self.session(path, root.name, now)
@@ -664,6 +996,10 @@ class ClaudeReader:
                                   parent=directory.parents[2].name, agents=agents,
                                   evidence='transcript activity; workflow completion unknown'))
             result.extend(task_rows(root, now))
+            # Scheduled jobs die with their process, so only running sessions are read.
+            if live is None:
+                live = claude_processes(self.home) or {}
+            result.extend(cron_rows(root, now, live))
         return result
 
     def session(self, path, cwd, now):
@@ -1074,7 +1410,7 @@ def clean(value, limit=100):
 
 # Record kinds aitop reads from Claude and Codex itself. Everything else comes
 # from aibus and takes its source as the kind.
-CORE_KINDS = ('session', 'workflow', 'agent', 'task')
+CORE_KINDS = ('session', 'workflow', 'agent', 'task', 'schedule')
 # aibus judges liveness. Its 'stopped' means the process went away without
 # reporting an end, which needs attention, so it shows as 'gone' instead of
 # joining the ended states that are hidden by default.
@@ -1248,7 +1584,8 @@ def collect(ai, project, all_projects, include_ended, bus, kind=None):
 
 # Live view. Drawing is kept apart from curses so tests can read the lines.
 # What aibus reports sits on top, MCP first, and Claude and Codex work follows under it.
-TUI_GROUPS = [('mcp', 'MCP'), ('task', 'Tasks'), ('bg-task', 'Background Tasks'), ('session', 'Sessions'),
+TUI_GROUPS = [('mcp', 'MCP'), ('task', 'Tasks'), ('bg-task', 'Background Tasks'), ('schedule', 'Scheduled'),
+              ('session', 'Sessions'),
               ('workflow', 'Workflows'), ('agent', 'Agents')]
 
 
@@ -1271,7 +1608,9 @@ TUI_ICONS = {'running': ('●', 'ok'), 'in-progress': ('◐', 'ok'), 'recent-out
              'unknown': ('?', 'warn'), 'turn-complete': ('✓', 'dim'), 'finished': ('✓', 'dim'),
              'stopped': ('■', 'dim'), 'failed': ('✗', 'bad'),
              # States that aibus entries add.
-             'ok': ('●', 'ok'), 'warn': ('!', 'warn'), 'late': ('?', 'warn'), 'gone': ('✗', 'bad')}
+             'ok': ('●', 'ok'), 'warn': ('!', 'warn'), 'late': ('?', 'warn'), 'gone': ('✗', 'bad'),
+             # Jobs a Claude session scheduled with CronCreate.
+             'scheduled': ('◷', 'info'), 'due': ('◷', 'warn')}
 TUI_AI = ['both', 'claude', 'codex']
 # The theme's own grey (ANSI bright black). A fixed neutral grey such as 238 looked
 # gold next to a blue-black background like Tokyo Night's.
@@ -1840,7 +2179,7 @@ the view quits, so an agent's prompt hook can read which rows a message is about
 In the live view, NOW is the last line a Claude shell command printed, so for a
 running command it is the step it is on. For a Claude agent it is its latest tool
 call. LEFT appears only while some command
-reports progress.
+reports progress or a job is scheduled.
 
 The table below is printed when the output is not a terminal (pipes, an agent's
 shell) or with --plain.
@@ -1855,6 +2194,8 @@ Columns:
           command turns bg once its script outlasts the yield time. Plain "task"
           is a stored Codex command or one whose kind cannot be read. The live
           view lists bg-task under Background Tasks and the rest under Tasks.
+          schedule: a job a running Claude session scheduled with CronCreate,
+          listed under Scheduled. LEFT is the time to its next run.
   LAST  Time since last session/agent/workflow activity or task output.
   STATE   The state below, with an exit code in parentheses when one is
           recorded: finished(0), failed(2).
@@ -1863,7 +2204,8 @@ Columns:
   PROGRESS
           Last progress a Claude shell command printed near the end of its output:
           "[n/m]" at the start of a line or "n%" at its end.
-  LEFT    Time left at the rate so far, while the command runs.
+  LEFT    Time left at the rate so far, while the command runs. For a schedule,
+          the time to its next run.
   -       Not applicable or unavailable.
 
 States:
@@ -1876,6 +2218,8 @@ States:
   failed         A background command exited non-zero, or a session's last turn ended on an API error.
   stopped        A background command was killed, a Codex turn was interrupted, or a Claude agent
                  was stopped by its session or the user.
+  scheduled      A scheduled job waiting for its next run.
+  due            A scheduled job past its time; it runs once its session is idle.
   ok, warn       What a tool last reported on aibus.
   late           An aibus entry that runs on a timer missed two runs.
   gone           An aibus entry whose process ended without reporting an end.
@@ -1890,7 +2234,7 @@ their last update is more than 24 hours old.
     parser.add_argument('-l', '--list-all', action='store_true', help='Also show completed, stopped, failed and archived records')
     parser.add_argument('-v', '--verbose', action='store_true', help='Show model, task and parent relationship')
     parser.add_argument('--plain', action='store_true', help='Print the table even in a terminal, instead of the live view')
-    parser.add_argument('--kind', help='Filter by record kind: agent, workflow, session, task, bg-task, or an aibus source such as mcp')
+    parser.add_argument('--kind', help='Filter by record kind: agent, workflow, session, task, bg-task, schedule, or an aibus source such as mcp')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     args = parser.parse_args(argv)
     if args.all_ai and args.kind:
