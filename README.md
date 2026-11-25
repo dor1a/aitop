@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/logo.svg" alt="" width="96">
+<img src="docs/logo.svg" alt="" width="200">
 
 # aitop
 
