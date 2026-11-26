@@ -1206,7 +1206,8 @@ class TuiTests(unittest.TestCase):
                 self.assertIn('NOW', texts[1])
                 self.assertIn('now', texts[texts.index(next(t for t in texts if '홈 맥' in t))])
                 self.assertIn('[2/4]', texts[5])
-                self.assertIn('LEFT', texts[1])  # a command reports progress
+                self.assertNotRegex(texts[1], r'(?<!\()LEFT')  # the time left sits in LAST(LEFT)
+                self.assertIn('1m40s left', texts[5])
                 self.assertIn('2/4', '\n'.join(texts))
                 self.assertIn('! docker down', '\n'.join(texts))
                 # The hidden count sits next to the key that shows it.
@@ -1214,8 +1215,25 @@ class TuiTests(unittest.TestCase):
                 self.assertTrue(texts[-1].rstrip().endswith('4 shown'), texts[-1])
                 # The key bar stays on the last line even when the list is short.
                 self.assertEqual((len(lines), lines[-1][0][0][1]), (40, 'bar'))
-                self.assertRegex(texts[1], r'^  STATE +NOW .*UPTIME +LAST +AI ')
+                self.assertRegex(texts[1], r'^  STATE +NOW .*UPTIME +LAST\(LEFT\) +AI ')
                 self.assertIn(' AI ', texts[1])  # both AIs are listed, so the AI column shows
+
+    def test_last_shows_the_time_left_for_jobs_and_busy_commands(self):
+        job = {'kind': 'schedule', 'updated': 0, 'left': 3600}
+        # A job's own activity is its scheduling, however long ago.
+        self.assertEqual(status.tui_last(job, 7500), '1h00m left')
+        self.assertEqual(status.tui_last(dict(job, left=None), 7500), '2h05m ago')
+        task = {'kind': 'task', 'updated': 1000, 'left': 720}
+        self.assertEqual(status.tui_last(task, 1010), '12m00s left')
+        # Quiet for over a minute: when it last printed says more than the old rate.
+        self.assertEqual(status.tui_last(task, 1000 + status.LEFT_STALE), '12m00s left')
+        self.assertEqual(status.tui_last(task, 1001 + status.LEFT_STALE), '1m01s ago')
+        self.assertEqual(status.tui_last(dict(task, left=None), 1001), 'now')
+        self.assertEqual(status.tui_last({'kind': 'session', 'updated': 0, 'quiet': True}, 50), '')
+        # The longest cells fit the column.
+        width = dict((name, w) for name, _, w, _ in status.tui_columns(200, True))['idle']
+        for cell in ('59m59s left', '59m59s ago', '23h59m left'):
+            self.assertLessEqual(len(cell), width, cell)
 
     def test_narrow_panes_cut_every_line_to_the_width(self):
         # A wide character that does not fit ends the line; later pieces do not slip in.
@@ -1251,7 +1269,7 @@ class TuiTests(unittest.TestCase):
         self.assertIn('l hide 1 hidden', texts[-1])
         self.assertTrue(texts[-1].rstrip().endswith('5 shown'), texts[-1])
         quiet = [r for r in rows if r['kind'] != 'task']
-        self.assertNotIn('LEFT', text(status.tui_screen(quiet, [], 2000, view(), 120, 30)[1]))
+        self.assertIn('LAST(LEFT)', text(status.tui_screen(quiet, [], 2000, view(), 120, 30)[1]))
         empty = [text(line) for line in status.tui_screen([], [], 2000, view(), 80, 10)]
         self.assertTrue(any('Nothing to show' in t for t in empty))
         self.assertIn('l show 0 hidden', empty[-1])

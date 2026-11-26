@@ -17,7 +17,7 @@ Read-only: it never starts, resumes or stops anything.
 
 ```
  aitop                                                           claude+codex   all projects   14:32:07
-  STATE             NOW                        UPTIME     LAST        AI      NAME / TITLE
+  STATE             NOW                        UPTIME     LAST(LEFT)  AI      NAME / TITLE
  MCP
 ▶ ● running                                    1h12m                  aibus   wiki MCP
  mac
@@ -117,7 +117,7 @@ aibus put backup nightly --title "nightly backup" --ai cron --pid $$
 | `now` | `NOW` |
 | `progress` | `PROGRESS` in the table, `N/M` in the details |
 | `started` | `UPTIME`, while the entry has a live process or is running |
-| `updated` | `LAST` |
+| `updated` | `LAST(LEFT)` |
 | `links`, `host` | The details pane |
 
 An entry whose process ended without reporting shows as `gone` and stays in view, and a scheduled job that missed two runs shows as `late`. Finished and failed entries join the ended records that `l` shows, and so does an entry whose last report was `ok`: a scheduled check that is fine has nothing to say until it turns `warn` or `late`.
@@ -137,7 +137,7 @@ aitop reads with `aibus ls --json --reader aitop`, so `aibus status` shows when 
 | `ok`, `warn`, `late`, `gone` | From aibus: what a tool reported, a missed schedule, a process that ended without reporting |
 | `scheduled`, `due` | A job a Claude session scheduled, before its time, or past it and waiting for the session to go idle |
 
-For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. A `Monitor` watch is a background task too. Nothing holds its output file open, so it counts as running until its end marker or its deadline, and it shows from the call on, before its first event writes the file. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. A job scheduled with `CronCreate` is listed under Scheduled while the Claude process that made it runs, since Claude Code keeps those jobs only in memory. aitop follows the `CronCreate`, `CronList` and `CronDelete` results in the transcript, and drops a one-shot job once its prompt comes back as a scheduled turn. For a job, `LEFT` is the time to its next run. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 20 stored command records per thread.
+For Claude, a shell command is listed when the transcript reports it as a background command, or while a foreground command is still running and writing its output file. The output file's end marker supplies the exit code. A `Monitor` watch is a background task too. Nothing holds its output file open, so it counts as running until its end marker or its deadline, and it shows from the call on, before its first event writes the file. `PROGRESS` and `LEFT` come from the last `[n/m]` at the start of a line or `n%` at the end of one. A job scheduled with `CronCreate` is listed under Scheduled while the Claude process that made it runs, since Claude Code keeps those jobs only in memory. aitop follows the `CronCreate`, `CronList` and `CronDelete` results in the transcript, and drops a one-shot job once its prompt comes back as a scheduled turn. For a job, `LEFT` is the time to its next run. The live view folds `LEFT` into `LAST(LEFT)`, which shows the time left instead (`12m00s left`) for a job, and for a command until it has printed nothing for a minute. For Codex, `ps` finds command roots under a Codex process by `CODEX_THREAD_ID`; `-l` adds the latest 20 stored command records per thread.
 
 Titles use command descriptions and program names, never arguments or output. The details pane shows the full command, up to five lines; the environment that names a Codex thread is never shown.
 

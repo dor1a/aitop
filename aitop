@@ -1662,12 +1662,11 @@ def tui_visible(rows, view, show_all=None):
                                        0 if r.get('quiet') else -r['updated'], r['title'], r['id']))
 
 
-def tui_columns(width, both, has_left=False):
+def tui_columns(width, both):
     """(name, label, width, align) for each column; NOW and the title split what is left."""
     head = [('state', 'STATE', 14, '<')]
-    # LEFT needs a progress mark, so it only takes room while some command reports one.
-    tail = ([('left', 'LEFT', 9, '<')] if has_left else []) + [('uptime', 'UPTIME', 9, '<'),
-                                                             ('idle', 'LAST', 10, '<')]
+    # LAST holds the time left too (see tui_last), so no column sits mostly empty for it.
+    tail = [('uptime', 'UPTIME', 9, '<'), ('idle', 'LAST(LEFT)', 11, '<')]
     if both:
         tail.append(('ai', 'AI', 6, '<'))
     used = 4 + sum(w + 2 for _, _, w, _ in head + tail) + 2  # two spaces after every column, NOW too
@@ -1675,15 +1674,28 @@ def tui_columns(width, both, has_left=False):
     return head + [('now', 'NOW', now, '<')] + tail + [('title', 'NAME / TITLE', max(0, width - used - now), '<')]
 
 
+# A command quiet longer than this shows how long ago it printed, not the time left at its old rate.
+LEFT_STALE = 60
+
+
+def tui_last(r, now):
+    """The LAST cell: the time left for a scheduled job (1h00m left), and for a command that
+    reports progress while it keeps printing; otherwise the time since the last activity. A
+    job's own activity is only its scheduling, which UPTIME already shows."""
+    age = None if r.get('quiet') else max(0, int(now - r['updated']))
+    left = r.get('left')
+    if left is not None and (r.get('kind') == 'schedule' or age is None or age <= LEFT_STALE):
+        return f'{duration(left)} left'
+    return '' if age is None else 'now' if age < 2 else f'{duration(age)} ago'
+
+
 def tui_cells(r, now):
     code = r.get('exit_code')
-    age = None if r.get('quiet') else max(0, int(now - r['updated']))
     return {
         'state': r['state'] + (f'({code})' if code is not None else ''),
         'now': clean(r.get('last_line') or '', 300),
-        'left': duration(r['left']) if r.get('left') is not None else '',
         'uptime': duration(r['uptime']) if r.get('uptime') is not None else '',
-        'idle': '' if age is None else 'now' if age < 2 else f'{duration(age)} ago',
+        'idle': tui_last(r, now),
         'ai': r['ai'],
         'title': clean(r['title'], 300),
     }
@@ -1701,7 +1713,7 @@ def tui_row(r, now, cols, selected, marked=False):
         text = fit(cells[name], width, align)
         # A marked row's text takes the mark color; the state keeps its own.
         segments.append((text, style if name == 'state' else 'mark' if marked
-                         else 'meta' if name in ('ai', 'left', 'uptime', 'idle') else ''))
+                         else 'meta' if name in ('ai', 'uptime', 'idle') else ''))
         segments.append(('  ', ''))
     return segments[:-1]
 
@@ -1872,7 +1884,7 @@ def tui_screen(rows, warnings, now, view, width, height):
     marked = view.setdefault('marked', set())
     marked &= {tui_key(r) for r in rows}
     both = view['ai'] == 'both' and len({r['ai'] for r in shown}) > 1
-    cols = tui_columns(width, both, any(r.get('left') is not None for r in shown))
+    cols = tui_columns(width, both)
     scope = {'both': 'claude+codex', 'claude': 'claude', 'codex': 'codex'}[view['ai']]
     flags = ([scope, 'all projects'] + (['showing hidden'] if view['show_all'] else [])
              + ([f"kind {view['kind']}"] if view['kind'] else [])
@@ -2178,8 +2190,9 @@ overrides it) while the view runs, and the file goes when the marks are cleared 
 the view quits, so an agent's prompt hook can read which rows a message is about.
 In the live view, NOW is the last line a Claude shell command printed, so for a
 running command it is the step it is on. For a Claude agent it is its latest tool
-call. LEFT appears only while some command
-reports progress or a job is scheduled.
+call. LAST(LEFT) shows the time left instead, as "12m00s left", for a scheduled job and
+for a command that reports progress, until the command prints nothing for a
+minute.
 
 The table below is printed when the output is not a terminal (pipes, an agent's
 shell) or with --plain.
