@@ -19,7 +19,7 @@ import tempfile
 import time
 import unicodedata
 
-__version__ = '0.1.7'
+__version__ = '0.1.8'
 TERMINAL_STATES = {'turn-complete', 'finished', 'stopped', 'failed'}
 # Hidden records stop being listed a day after their last update; this is a view of
 # what runs now, and older history ran to hundreds of rows behind l.
